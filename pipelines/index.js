@@ -36,7 +36,7 @@ function defaultNode(type, x, y) {
     if (type === "output") base.config = { label: "Output", text: "{{upstream}}" };
     if (type === "bash") base.config = { label: "Shell", command: "echo {{upstream}}", timeout: 120 };
     if (type === "branch") base.config = { label: "Branch", template: "{{upstream}}", mode: "contains", value: "yes" };
-    if (type === "decision") base.config = { label: "Decision", kind: "choice", template: "{{upstream}}", instructions: "", categories: "billing: payment or subscription issues\ntechnical: the product is broken or unusable\nsales: wants pricing or a demo", model: "jev-latest", threshold: 50, minConfidence: 0 };
+    if (type === "decision") base.config = { label: "Decision", provider: "jev", kind: "choice", template: "{{upstream}}", instructions: "", categories: "billing: payment or subscription issues\ntechnical: the product is broken or unusable\nsales: wants pricing or a demo", model: "", threshold: 50, minConfidence: 0 };
     if (type === "loop") base.config = { label: "Loop", system: "", prompt: "Improve this:\n{{prev}}", times: 3, until: "", model: "" };
     return base;
 }
@@ -123,6 +123,7 @@ export default function setup(pocket) {
         const [sessionId, setSessionId] = useState(pocket.conversationId() || "");
         const [models, setModels] = useState([]);
         const [thinkingLevels, setThinkingLevels] = useState([]);
+        const [apiKeys, setApiKeys] = useState({});
         const [input, setInput] = useState("");
         const [msg, setMsg] = useState("");
         const [err, setErr] = useState("");
@@ -146,7 +147,7 @@ export default function setup(pocket) {
                 setSessions(s.items);
                 setSessionId((cur) => cur || (s.items[0] && s.items[0].id) || "");
             }).catch(() => {});
-            pocket.api("meta").then((m) => { setModels(m.models || []); setThinkingLevels(m.thinkingLevels || []); }).catch(() => {});
+            pocket.api("meta").then((m) => { setModels(m.models || []); setThinkingLevels(m.thinkingLevels || []); setApiKeys(m.keys || {}); }).catch(() => {});
             const offRun = pocket.on("run", (run) => {
                 if (!run || !run.id) return;
                 setRuns((prev) => [run, ...prev.filter((r) => r.id !== run.id)].slice(0, 50));
@@ -306,7 +307,7 @@ export default function setup(pocket) {
                         return html`<div class=${"pnode" + (n.id === selNode ? " sel" : "")} style=${`left:${n.x}px;top:${n.y}px;border-color:${colorOf(n.type)}`} onPointerDown=${(e) => startDrag(e, n)} onClick=${() => { setSelNode(n.id); setSelEdge(null); }}>
                             <div class="pnode-head"><span class="pdot" style=${`background:${colorOf(n.type)}`}></span><b>${labelOf(n)}</b><span class="muted small">${n.type}</span>
                             ${running ? html`<span class="small" style="color:var(--warn)">running…</span>` : runOut !== undefined && runOut !== false ? html`<span class="small" style="color:var(--ok)">✓</span>` : null}</div>
-                            <div class="pnode-sub muted small">${n.type === "llm" || n.type === "agent" ? n.config.model || "session model" : n.type === "loop" ? `×${n.config.times || 3}` : n.type === "bash" ? String(n.config.command || "").slice(0, 34) : n.type === "subpipe" ? String(n.config.pipeline || "").slice(0, 34) : n.type === "branch" ? `${n.config.mode || "contains"} “${n.config.value || ""}”` : n.type === "decision" ? `${n.config.kind === "noul" ? "yes/no" : `${String(n.config.categories || "").split("\n").filter((l) => l.trim() !== "").length} choices`}` : ""}</div>
+                            <div class="pnode-sub muted small">${n.type === "llm" || n.type === "agent" ? n.config.model || "session model" : n.type === "loop" ? `×${n.config.times || 3}` : n.type === "bash" ? String(n.config.command || "").slice(0, 34) : n.type === "subpipe" ? String(n.config.pipeline || "").slice(0, 34) : n.type === "branch" ? `${n.config.mode || "contains"} “${n.config.value || ""}”` : n.type === "decision" ? `${n.config.provider === "openai" ? "openai" : n.config.provider === "openrouter" ? "openrouter" : "jev"} · ${n.config.kind === "noul" ? "yes/no" : n.config.kind === "score" ? "score" : `${String(n.config.categories || "").split("\n").filter((l) => l.trim() !== "").length} choices`}` : ""}</div>
                             <span class="pport in" title="Input — tap after choosing an output" onPointerDown=${(e) => onPortIn(e, n.id)}></span>
                             <span class="pport out" title="Output — tap, then tap a target input" onPointerDown=${(e) => onPortOut(e, n.id)}></span>
                         </div>`;
@@ -347,18 +348,24 @@ export default function setup(pocket) {
                     <label class="pipe-field">Value<input class="pipe-in" value=${node.config.value || ""} onInput=${(e) => patchConfig(node.id, "value", e.target.value)} /></label>
                     <p class="muted small">Then tap each edge leaving this node and set it to “when true” or “when false”.</p>` : null}
                 ${node.type === "decision" ? html`
+                    <label class="pipe-field">Classifier<select class="pipe-in" value=${node.config.provider || "jev"} onChange=${(e) => patchConfig(node.id, "provider", e.target.value)}>
+                        <option value="jev">Jev — direct (typesafe.ai)</option><option value="openrouter">Jev — via OpenRouter</option><option value="openai">OpenAI Decisions</option></select></label>
+                    ${!(apiKeys[node.config.provider || "jev"]) ? html`<p class="small" style="color:var(--warn)">No key saved for this provider — add it in Pipelines settings (Extensions sheet), or set ${node.config.provider === "openai" ? "OPENAI_API_KEY" : node.config.provider === "openrouter" ? "OPENROUTER_API_KEY" : "TYPESAFE_API_KEY"} on the server.</p>` : null}
                     <label class="pipe-field">Judge<select class="pipe-in" value=${node.config.kind || "choice"} onChange=${(e) => patchConfig(node.id, "kind", e.target.value)}>
-                        <option value="choice">Choice — pick one category (Jev classifier)</option><option value="noul">Yes / No — answer a yes-no question (Jev probability)</option></select></label>
+                        <option value="choice">Choice — pick one category</option><option value="noul">Yes / No — answer a yes-no question</option><option value="score">Score — rate against ordered levels</option></select></label>
                     <label class="pipe-field">Text to judge<textarea class="pipe-in" rows="3" value=${node.config.template || ""} onInput=${(e) => patchConfig(node.id, "template", e.target.value)}></textarea></label>
-                    <label class="pipe-field">Question for Jev<textarea class="pipe-in" rows="2" value=${node.config.instructions || ""} onInput=${(e) => patchConfig(node.id, "instructions", e.target.value)} placeholder="Which team should handle this?"></textarea></label>
+                    <label class="pipe-field">Question<textarea class="pipe-in" rows="2" value=${node.config.instructions || ""} onInput=${(e) => patchConfig(node.id, "instructions", e.target.value)} placeholder="Which team should handle this?"></textarea></label>
                     ${node.config.kind === "noul" ? html`
                         <label class="pipe-field">Yes when P(yes) ≥ (%)<input class="pipe-in" type="number" min="0" max="100" value=${node.config.threshold ?? 50} onInput=${(e) => patchConfig(node.id, "threshold", e.target.value === "" ? "" : Number(e.target.value))} /></label>
-                        <p class="muted small">Outputs “true” or “false”. Route edges with “when true” / “when false”.</p>` : html`
+                        <p class="muted small">Outputs “true” or “false”. Route edges with “when true” / “when false”.</p>` : node.config.kind === "score" ? html`
+                        <label class="pipe-field">Levels — one “label: when it applies” per line, lowest first<textarea class="pipe-in mono" rows="4" value=${node.config.categories || ""} onInput=${(e) => patchConfig(node.id, "categories", e.target.value)}></textarea></label>
+                        <label class="pipe-field">High at score ≥<input class="pipe-in" type="number" min="0" max="9" step="0.5" value=${node.config.cut ?? ""} onInput=${(e) => patchConfig(node.id, "cut", e.target.value === "" ? "" : Number(e.target.value))} placeholder="middle of the levels" /></label>
+                        <p class="muted small">Outputs “high” or “low”. Route edges with “when high” / “when low”.</p>` : html`
                         <label class="pipe-field">Categories — one “name: when it applies” per line<textarea class="pipe-in mono" rows="5" value=${node.config.categories || ""} onInput=${(e) => patchConfig(node.id, "categories", e.target.value)}></textarea></label>
                         <p class="muted small">Outputs the winning category name. Tap each edge leaving this step and set “when” to a category name.</p>`}
-                    <label class="pipe-field">Jev model<input class="pipe-in" value=${node.config.model || "jev-latest"} onInput=${(e) => patchConfig(node.id, "model", e.target.value)} placeholder="jev-latest" /></label>
+                    <label class="pipe-field">Model (blank = provider default: jev-latest · typesafe/jev-1.14 · gpt-6-luna)<input class="pipe-in" value=${node.config.model || ""} onInput=${(e) => patchConfig(node.id, "model", e.target.value)} placeholder="provider default" /></label>
                     <label class="pipe-field">Unsure below confidence (%)<input class="pipe-in" type="number" min="0" max="100" value=${node.config.minConfidence ?? 0} onInput=${(e) => patchConfig(node.id, "minConfidence", e.target.value === "" ? "" : Number(e.target.value))} /></label>
-                    <p class="muted small">0 = always take the winner. Above 0, low-confidence answers output “unsure” — route them with “when unsure”. Needs a Jev API key in Pipelines settings.</p>` : null}
+                    <p class="muted small">0 = always take the winner. Above 0, low-confidence answers output “unsure” — route them with “when unsure”.</p>` : null}
                 ${node.type === "code" ? html`
                     <label class="pipe-field">JavaScript — globals: input, upstream, outputs (by node id). Return a value, or console.log it. No tools, files, or network.<textarea class="pipe-in mono" rows="8" value=${node.config.code || ""} onInput=${(e) => patchConfig(node.id, "code", e.target.value)}></textarea></label>
                     <label class="pipe-field">Timeout (seconds, max 60)<input class="pipe-in" type="number" min="1" max="60" value=${node.config.timeout ?? 10} onInput=${(e) => patchConfig(node.id, "timeout", e.target.value === "" ? "" : Number(e.target.value))} /></label>` : null}

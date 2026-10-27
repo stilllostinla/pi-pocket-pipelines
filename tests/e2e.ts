@@ -218,17 +218,19 @@ await put("NoKeyPipe", {
     edges: [{ id: "m1", from: "in", to: "d" }, { id: "m2", from: "d", to: "out" }],
 });
 const noKey = await runPipe("NoKeyPipe", "charge twice");
-check("decision without a key fails with guidance", noKey.includes("· failed") && noKey.includes("Jev API key"));
+check("decision without a key fails with guidance", noKey.includes("· failed") && noKey.includes("API key"));
 
-let jevCalls: unknown[] = [];
-const jevQueue: unknown[] = [];
-(globalThis as { fetch?: unknown }).fetch = async (url: unknown, init: { body?: string }) => {
-    if (String(url) !== "https://api.typesafe.ai/v1/systemone") throw new Error(`unexpected fetch ${String(url)}`);
-    jevCalls.push(JSON.parse(init.body ?? "{}"));
-    const next = jevQueue.shift();
+type FetchCall = { url: string; auth: string; referer?: string; body: Record<string, unknown> };
+const fetchCalls: FetchCall[] = [];
+const fetchQueue: unknown[] = [];
+(globalThis as { fetch?: unknown }).fetch = async (url: unknown, init: { body?: string; headers?: Record<string, string> }) => {
+    fetchCalls.push({ url: String(url), auth: init.headers?.Authorization ?? "", referer: init.headers?.["HTTP-Referer"], body: JSON.parse(init.body ?? "{}") });
+    const next = fetchQueue.shift();
     return { ok: true, status: 200, json: async () => next, text: async () => JSON.stringify(next) };
 };
 process.env.TYPESAFE_API_KEY = "test-key";
+process.env.OPENROUTER_API_KEY = "or-key";
+process.env.OPENAI_API_KEY = "oa-key";
 const choiceAnswer = {
     model: "jev-latest",
     answers: { q: { type: "choice", choice: "billing", confidence: 0.8, probabilities: { billing: 0.8, technical: 0.2 } } },
@@ -247,14 +249,15 @@ await put("ChoicePipe", {
         { id: "m3", from: "d", to: "tech", when: "technical" },
     ],
 });
-jevQueue.push(choiceAnswer);
+fetchQueue.push(choiceAnswer);
 const choice = await runPipe("ChoicePipe", "charge twice");
 check("decision choice routes by winner", choice.includes("· done") && choice.includes("B:billing"));
 check("losing category path skipped", choice.includes("Skipped: tech"));
-check("jev got state+questions", (jevCalls[0] as { questions?: { q?: { type?: string; criteria?: object } } }).questions?.q?.type === "choice");
+check("jev got state+questions", (fetchCalls[0]?.body as { questions?: { q?: { type?: string } } }).questions?.q?.type === "choice");
+check("jev direct auth", fetchCalls[0]?.url === "https://api.typesafe.ai/v1/systemone" && fetchCalls[0]?.auth === "Bearer test-key");
 check("choice logged with confidence", choice.includes("billing (80%)"));
 
-jevQueue.push(choiceAnswer);
+fetchQueue.push(choiceAnswer);
 await put("UnsurePipe", {
     nodes: [
         { id: "in", type: "input", x: 0, y: 0, config: { label: "Input" } },
@@ -266,8 +269,8 @@ await put("UnsurePipe", {
 const unsure = await runPipe("UnsurePipe", "charge twice");
 check("low confidence routes to unsure", unsure.includes("· done") && unsure.includes("H:unsure"));
 
-jevQueue.push({ model: "jev-latest", answers: { q: { type: "noul", noul: 0.7 } }, usage: { input_tokens: 10, output_tokens: 1 } });
-jevQueue.push({ model: "jev-latest", answers: { q: { type: "noul", noul: 0.2 } }, usage: { input_tokens: 10, output_tokens: 1 } });
+fetchQueue.push({ model: "jev-latest", answers: { q: { type: "noul", noul: 0.7 } }, usage: { input_tokens: 10, output_tokens: 1 } });
+fetchQueue.push({ model: "jev-latest", answers: { q: { type: "noul", noul: 0.2 } }, usage: { input_tokens: 10, output_tokens: 1 } });
 await put("NoulPipe", {
     nodes: [
         { id: "in", type: "input", x: 0, y: 0, config: { label: "Input" } },
@@ -290,6 +293,111 @@ try {
     threw = e instanceof Error ? e.message : String(e);
 }
 check("choice with no categories is refused", threw.includes("at least one category"));
+
+// 8. OpenRouter Jev: same contract, OpenRouter endpoint + headers.
+fetchQueue.push({
+    model: "typesafe/jev-1.14",
+    answers: { q: { type: "choice", choice: "technical", confidence: 0.9, probabilities: { technical: 0.9, billing: 0.1 } } },
+    usage: { prompt_tokens: 60, completion_tokens: 6 },
+});
+await put("ORPipe", {
+    nodes: [
+        { id: "in", type: "input", x: 0, y: 0, config: { label: "Input" } },
+        { id: "d", type: "decision", x: 0, y: 0, config: { label: "Route", provider: "openrouter", kind: "choice", template: "{{upstream}}", instructions: "Which team?", categories: "billing: money\ntechnical: broken" } },
+        { id: "out", type: "output", x: 0, y: 0, config: { label: "Output", text: "{{upstream}}" } },
+    ],
+    edges: [{ id: "m1", from: "in", to: "d" }, { id: "m2", from: "d", to: "out", when: "technical" }],
+});
+const or = await runPipe("ORPipe", "it broke");
+const orCall = fetchCalls[fetchCalls.length - 1]!;
+check("openrouter routes winner", or.includes("· done") && or.includes("technical"));
+check("openrouter endpoint+auth+referer", orCall.url === "https://openrouter.ai/api/v1/systemone" && orCall.auth === "Bearer or-key" && (orCall.referer ?? "").includes("pi-pocket-pipelines"));
+check("openrouter prompt_tokens counted", or.includes("technical (90%)"));
+
+// 9. OpenAI Decisions: choice + predicate + score + refusal.
+fetchQueue.push({
+    answers: [{ name: "q", type: "choice", choice: "sales", confidence: 0.95, probabilities: [{ value: "sales", probability: 0.95 }] }],
+});
+await put("OACPipe", {
+    nodes: [
+        { id: "in", type: "input", x: 0, y: 0, config: { label: "Input" } },
+        { id: "d", type: "decision", x: 0, y: 0, config: { label: "Route", provider: "openai", kind: "choice", template: "{{upstream}}", instructions: "Which team?", categories: "billing: money\nsales: pricing" } },
+        { id: "out", type: "output", x: 0, y: 0, config: { label: "Output", text: "{{upstream}}" } },
+    ],
+    edges: [{ id: "m1", from: "in", to: "d" }, { id: "m2", from: "d", to: "out", when: "sales" }],
+});
+const oac = await runPipe("OACPipe", "price please");
+const oacCall = fetchCalls[fetchCalls.length - 1]!;
+check("openai choice routes", oac.includes("· done") && oac.includes("sales"));
+check("openai decisions shape", oacCall.url === "https://api.openai.com/v1/decisions"
+    && (oacCall.body as { model?: string; questions?: { type?: string; name?: string; choices?: { value?: string }[] }[] }).model === "gpt-6-luna"
+    && (oacCall.body as { questions?: { type?: string; choices?: unknown[] }[] }).questions?.[0]?.type === "choice");
+check("openai choice logged", oac.includes("sales (95%)"));
+
+fetchQueue.push({ answers: [{ name: "q", type: "predicate", probability: 0.8 }] });
+await put("OAPPipe", {
+    nodes: [
+        { id: "in", type: "input", x: 0, y: 0, config: { label: "Input" } },
+        { id: "d", type: "decision", x: 0, y: 0, config: { label: "Spam?", provider: "openai", kind: "noul", template: "{{upstream}}", instructions: "Is this spam?" } },
+        { id: "out", type: "output", x: 0, y: 0, config: { label: "Output", text: "{{upstream}}" } },
+    ],
+    edges: [{ id: "m1", from: "in", to: "d" }, { id: "m2", from: "d", to: "out", when: "true" }],
+});
+const oap = await runPipe("OAPPipe", "buy now");
+check("openai predicate true", oap.includes("· done") && oap.includes("true"));
+
+fetchQueue.push({ answers: [{ name: "q", type: "score", score: 2, confidence: 0.9, probabilities: [{ value: 2, probability: 0.9 }] }] });
+await put("OASPipe", {
+    nodes: [
+        { id: "in", type: "input", x: 0, y: 0, config: { label: "Input" } },
+        { id: "d", type: "decision", x: 0, y: 0, config: { label: "Sev", provider: "openai", kind: "score", template: "{{upstream}}", instructions: "How severe?", categories: "low: minor\nmid: workaround\nhigh: blocked", cut: 1.5 } },
+        { id: "hi", type: "output", x: 0, y: 0, config: { label: "Hi", text: "H:{{upstream}}" } },
+        { id: "lo", type: "output", x: 0, y: 0, config: { label: "Lo", text: "L:{{upstream}}" } },
+    ],
+    edges: [{ id: "m1", from: "in", to: "d" }, { id: "m2", from: "d", to: "hi", when: "high" }, { id: "m3", from: "d", to: "lo", when: "low" }],
+});
+const oas = await runPipe("OASPipe", "all down");
+check("openai score high/low routing", oas.includes("· done") && oas.includes("H:high") && oas.includes("Skipped: lo"));
+
+fetchQueue.push({ answers: [{ name: "q", type: "refusal" }] });
+await put("OARefPipe", {
+    nodes: [
+        { id: "in", type: "input", x: 0, y: 0, config: { label: "Input" } },
+        { id: "d", type: "decision", x: 0, y: 0, config: { label: "Route", provider: "openai", kind: "choice", template: "{{upstream}}", instructions: "Pick.", categories: "a: x\nb: y" } },
+        { id: "out", type: "output", x: 0, y: 0, config: { label: "Output", text: "{{upstream}}" } },
+    ],
+    edges: [{ id: "m1", from: "in", to: "d" }, { id: "m2", from: "d", to: "out" }],
+});
+const oar = await runPipe("OARefPipe", "???");
+check("openai refusal fails helpfully", oar.includes("· failed") && oar.includes("refused"));
+
+// 10. Score via Jev + score validation.
+fetchQueue.push({
+    model: "jev-latest",
+    answers: { q: { type: "score", score: 0.4, confidence: 0.8, legend: { 0: "low", 1: "mid", 2: "high" }, probabilities: { 0: 0.7, 1: 0.2, 2: 0.1 } } },
+    usage: { input_tokens: 20, output_tokens: 2 },
+});
+await put("JevScorePipe", {
+    nodes: [
+        { id: "in", type: "input", x: 0, y: 0, config: { label: "Input" } },
+        { id: "d", type: "decision", x: 0, y: 0, config: { label: "Sev", kind: "score", template: "{{upstream}}", instructions: "How severe?", categories: "low: minor\nmid: workaround\nhigh: blocked" } },
+        { id: "lo", type: "output", x: 0, y: 0, config: { label: "Lo", text: "L:{{upstream}}" } },
+    ],
+    edges: [{ id: "m1", from: "in", to: "d" }, { id: "m2", from: "d", to: "lo", when: "low" }],
+});
+const jsc = await runPipe("JevScorePipe", "typo");
+check("jev score low routing (default middle cut)", jsc.includes("· done") && jsc.includes("L:low") && jsc.includes("score 0.4"));
+
+let threwScore = "";
+try {
+    await tool("pipe_put").execute({ name: "BadScore", graphJson: JSON.stringify({
+        nodes: [{ id: "d", type: "decision", x: 0, y: 0, config: { label: "Sev", kind: "score", instructions: "How severe?", categories: "only: one" } }],
+        edges: [],
+    }) } as never, api(901, "bad2") as never, context as never);
+} catch (e) {
+    threwScore = e instanceof Error ? e.message : String(e);
+}
+check("score with one level is refused", threwScore.includes("at least 2 levels"));
 
 console.log(fails.length ? `E2E-FAIL (${fails.length})` : "E2E-OK");
 await harness.close(context);

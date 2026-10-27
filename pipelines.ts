@@ -126,22 +126,36 @@ function sanitizeGraph(raw: unknown): PipeGraph {
         if (!NODE_TYPES.includes(type)) throw new Error(`Unknown node type ${type || "(blank)"}.`);
         const configIn = (node.config ?? {}) as Record<string, unknown>;
         const config: Record<string, unknown> = { label: cleanText(configIn.label, 120) };
-        for (const key of ["prompt", "system", "text", "template", "command", "value", "until", "model", "code", "title", "thinking", "pipeline", "onDecline", "onError", "kind", "categories", "instructions"]) {
+        for (const key of ["prompt", "system", "text", "template", "command", "value", "until", "model", "code", "title", "thinking", "pipeline", "onDecline", "onError", "kind", "categories", "instructions", "provider"]) {
             if (configIn[key] !== undefined) config[key] = cleanText(configIn[key]);
         }
         if (configIn.minConfidence !== undefined) config.minConfidence = cleanNumber(configIn.minConfidence, 0, 0, 100);
         if (configIn.threshold !== undefined) config.threshold = cleanNumber(configIn.threshold, 50, 0, 100);
+        if (configIn.cut !== undefined) {
+            const raw = typeof configIn.cut === "number" && Number.isFinite(configIn.cut) ? configIn.cut : NaN;
+            if (Number.isFinite(raw)) config.cut = Math.min(9, Math.max(0, Math.round(raw * 10) / 10));
+        }
         if (configIn.askInput !== undefined) config.askInput = configIn.askInput === true;
         if (configIn.mode !== undefined) config.mode = cleanText(configIn.mode, 40);
         if (configIn.times !== undefined) config.times = cleanNumber(configIn.times, 3, 1, 20);
         if (configIn.timeout !== undefined) config.timeout = cleanNumber(configIn.timeout, 120, 1, 600);
         if (type === "decision") {
+            const provider = cleanText(config.provider, 20) || "jev";
+            if (provider !== "jev" && provider !== "openrouter" && provider !== "openai") {
+                throw new Error(`Decision step ${id} has provider ${provider || "(blank)"}: use jev, openrouter, or openai.`);
+            }
+            config.provider = provider;
             const kind = cleanText(config.kind, 20) || "choice";
-            if (kind !== "choice" && kind !== "noul") throw new Error(`Decision step ${id} has kind ${kind || "(blank)"}: use choice or noul.`);
+            if (kind !== "choice" && kind !== "noul" && kind !== "score") {
+                throw new Error(`Decision step ${id} has kind ${kind || "(blank)"}: use choice, noul, or score.`);
+            }
             config.kind = kind;
-            if (cleanText(config.instructions, 2000).trim() === "") throw new Error(`Decision step ${id} needs instructions (the question Jev should judge).`);
-            if (kind === "choice") {
+            if (cleanText(config.instructions, 2000).trim() === "") throw new Error(`Decision step ${id} needs instructions (the question to judge).`);
+            if (kind === "choice" || kind === "score") {
                 const cats = parseCategories(cleanText(config.categories, 8000));
+                if (kind === "score" && cats.length < 2) {
+                    throw new Error(`Decision step ${id} needs at least 2 levels ("label: when it applies", one per line, at most 10).`);
+                }
                 if (cats.length === 0) throw new Error(`Decision step ${id} needs at least one category ("name: when it applies", one per line).`);
                 config.categories = cats.map((c) => `${c.name}: ${c.desc}`).join("\n");
             }
@@ -324,18 +338,70 @@ function runTaskFor(host: Host, web: Web) {
         return { text, usage: reply.usage, modelKey: `${ref.provider}/${ref.modelId}` };
     }
 
-    /** Classify text with Jev (typesafe.ai): Choice picks one category, Noul answers yes/no with a probability. */
-    async function jevClassify(
-        node: PipeNode,
-        stateText: string,
-        runInput: string,
-    ): Promise<{ text: string; detail: string; modelKey: string; usage: { input: number; output: number; cacheRead: number; cacheWrite: number; totalTokens: number; cost: { input: number; output: number; cacheRead: number; cacheWrite: number; total: number } } }> {
-        const fromSetting =
-            typeof web.setting === "function" ? cleanText(web.setting("jevKey"), 500) : "";
-        const key = fromSetting.trim() !== "" ? fromSetting.trim() : (process.env.TYPESAFE_API_KEY ?? "").trim();
+    /** The credentials store: server-side keys for each classifier provider. Settings first, environment fallback. */
+    function credential(provider: "jev" | "openrouter" | "openai"): string {
+        const fromSetting = (name: string) =>
+            typeof web.setting === "function" ? cleanText(web.setting(name), 500).trim() : "";
+        const env = (typeof process !== "undefined" ? process.env : {}) as Record<string, string | undefined>;
+        if (provider === "jev") return fromSetting("jevKey") || (env.TYPESAFE_API_KEY ?? "").trim();
+        if (provider === "openrouter") return fromSetting("openrouterKey") || (env.OPENROUTER_API_KEY ?? "").trim();
+        return fromSetting("openaiKey") || (env.OPENAI_API_KEY ?? "").trim();
+    }
+
+    type Classified = {
+        text: string;
+        detail: string;
+        modelKey: string;
+        usage: {
+            input: number;
+            output: number;
+            cacheRead: number;
+            cacheWrite: number;
+            totalTokens: number;
+            cost: { input: number; output: number; cacheRead: number; cacheWrite: number; total: number };
+        };
+    };
+
+    async function postClassifier(url: string, key: string, body: unknown, extraHeaders: Record<string, string>, label: string): Promise<{ data: never; usageIn: number; usageOut: number }> {
+        let res: Response;
+        try {
+            res = await fetch(url, {
+                method: "POST",
+                headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json", ...extraHeaders },
+                body: JSON.stringify(body),
+                signal: AbortSignal.timeout(60_000),
+            });
+        } catch (error) {
+            throw new Error(`${label} request failed: ${error instanceof Error ? error.message : String(error)}`);
+        }
+        if (!res.ok) {
+            if (res.status === 401 || res.status === 403) {
+                throw new Error(`${label} refused the API key (401/403). Check the key in Pipelines settings.`);
+            }
+            throw new Error(`${label} error ${res.status}: ${(await res.text()).slice(0, 500)}`);
+        }
+        const data = (await res.json()) as never;
+        const u = (data as { usage?: { input_tokens?: number; output_tokens?: number; prompt_tokens?: number; completion_tokens?: number } }).usage ?? {};
+        return { data, usageIn: u.input_tokens ?? u.prompt_tokens ?? 0, usageOut: u.output_tokens ?? u.completion_tokens ?? 0 };
+    }
+
+    /**
+     * Classify text with any decision-model provider. Choice picks one category (outputs its name),
+     * Noul/predicate answers yes/no (outputs true/false), Score rates against ordered levels (outputs high/low).
+     * Below the confidence bar the step outputs unsure, for an edge to route to review.
+     */
+    async function classifyDecision(node: PipeNode, stateText: string, runInput: string): Promise<Classified> {
+        const provider = (cleanText(node.config.provider, 20) || "jev") as "jev" | "openrouter" | "openai";
+        const key = credential(provider);
         if (key === "") {
+            const hint =
+                provider === "jev"
+                    ? "TYPESAFE_API_KEY"
+                    : provider === "openrouter"
+                      ? "OPENROUTER_API_KEY"
+                      : "OPENAI_API_KEY";
             throw new Error(
-                "Decision steps need a Jev API key: set it in Pipelines settings (Menu → Extensions → Pipelines), or TYPESAFE_API_KEY on the server.",
+                `Decision steps on ${provider} need an API key: set it in Pipelines settings (Menu → Extensions → Pipelines), or ${hint} on the server.`,
             );
         }
         const kind = cleanText(node.config.kind, 20) || "choice";
@@ -345,61 +411,115 @@ function runTaskFor(host: Host, web: Web) {
             outputs: new Map(),
             nodes: [],
         });
-        const model = cleanText(node.config.model, 60) || "jev-latest";
+        const cats = parseCategories(cleanText(node.config.categories, 8000));
+        const minConf = cleanNumber(node.config.minConfidence, 0, 0, 100) / 100;
+        const zeroUsage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
+        const withUsage = (usageIn: number, usageOut: number) => ({
+            ...zeroUsage,
+            input: usageIn,
+            output: usageOut,
+            totalTokens: usageIn + usageOut,
+        });
+
+        if (provider === "openai") {
+            const model = cleanText(node.config.model, 60) || "gpt-6-luna";
+            const modelKey = `openai/${model}`;
+            const question =
+                kind === "noul"
+                    ? { type: "predicate", name: "q", instructions }
+                    : kind === "score"
+                      ? {
+                            type: "score",
+                            name: "q",
+                            instructions,
+                            levels: cats.map((c) => ({ label: c.name, description: c.desc })),
+                        }
+                      : {
+                            type: "choice",
+                            name: "q",
+                            instructions,
+                            choices: cats.map((c) => ({ value: c.name, description: c.desc })),
+                        };
+            const { data, usageIn, usageOut } = await postClassifier(
+                "https://api.openai.com/v1/decisions",
+                key,
+                { model, input: stateText.slice(0, 20000), questions: [question] },
+                {},
+                "OpenAI Decisions",
+            );
+            const answer = (data as { answers?: { name?: string; type?: string; probability?: number; choice?: string; confidence?: number; score?: number }[] }).answers?.find((a) => a.name === "q");
+            if (answer === undefined) throw new Error("OpenAI Decisions answered without a decision.");
+            if (answer.type === "refusal") throw new Error("OpenAI refused to judge this text (refusal). Rephrase or route it to review.");
+            const usage = withUsage(usageIn, usageOut);
+            if (kind === "noul" && answer.type === "predicate") {
+                const p = answer.probability ?? NaN;
+                if (!Number.isFinite(p)) throw new Error("OpenAI answered without a probability.");
+                const threshold = cleanNumber(node.config.threshold, 50, 0, 100) / 100;
+                const conf = p >= threshold ? p : 1 - p;
+                const text = conf < minConf ? "unsure" : p >= threshold ? "true" : "false";
+                return { text, detail: `P(yes) ${(p * 100).toFixed(0)}% → ${text}`, modelKey, usage };
+            }
+            if (kind === "score" && answer.type === "score") {
+                const score = answer.score ?? NaN;
+                const conf = answer.confidence ?? NaN;
+                if (!Number.isFinite(score)) throw new Error("OpenAI answered without a score.");
+                const cut = typeof node.config.cut === "number" ? node.config.cut : (cats.length - 1) / 2;
+                const text = Number.isFinite(conf) && conf < minConf ? "unsure" : score >= cut ? "high" : "low";
+                return { text, detail: `score ${score.toFixed(1)} → ${text}`, modelKey, usage };
+            }
+            if (kind === "choice" && answer.type === "choice") {
+                const winner = answer.choice ?? "";
+                const conf = answer.confidence ?? NaN;
+                if (winner === "" || !Number.isFinite(conf)) throw new Error("OpenAI answered without a category.");
+                if (conf < minConf) return { text: "unsure", detail: `best ${winner} (${(conf * 100).toFixed(0)}%) below bar`, modelKey, usage };
+                return { text: winner, detail: `${winner} (${(conf * 100).toFixed(0)}%)`, modelKey, usage };
+            }
+            throw new Error(`OpenAI answered a ${answer.type ?? "unknown"} for a ${kind} question.`);
+        }
+
+        // Jev shapes, direct or through OpenRouter (same System One contract).
+        const isOR = provider === "openrouter";
+        const model = cleanText(node.config.model, 60) || (isOR ? "typesafe/jev-1.14" : "jev-latest");
+        const modelKey = `${isOR ? "openrouter" : "typesafe"}/${model}`;
         const question =
             kind === "noul"
                 ? { type: "noul", instructions }
-                : {
-                      type: "choice",
-                      instructions,
-                      criteria: Object.fromEntries(
-                          parseCategories(cleanText(node.config.categories, 8000)).map((c) => [c.name, c.desc]),
-                      ),
-                  };
-        let res: Response;
-        try {
-            res = await fetch("https://api.typesafe.ai/v1/systemone", {
-                method: "POST",
-                headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
-                body: JSON.stringify({ model, state: stateText.slice(0, 20000), questions: { q: question } }),
-                signal: AbortSignal.timeout(60_000),
-            });
-        } catch (error) {
-            throw new Error(`Jev request failed: ${error instanceof Error ? error.message : String(error)}`);
-        }
-        if (!res.ok) {
-            if (res.status === 401 || res.status === 403) {
-                throw new Error("Jev refused the API key (401/403). Check the key in Pipelines settings.");
-            }
-            throw new Error(`Jev error ${res.status}: ${(await res.text()).slice(0, 500)}`);
-        }
-        const data = (await res.json()) as {
-            answers?: { q?: { type?: string; choice?: string; confidence?: number; probabilities?: Record<string, number>; noul?: number } };
-            usage?: { input_tokens?: number; output_tokens?: number };
-        };
-        const answer = data.answers?.q;
-        if (answer === undefined) throw new Error("Jev answered without a decision.");
-        const usage = {
-            input: data.usage?.input_tokens ?? 0,
-            output: data.usage?.output_tokens ?? 0,
-            cacheRead: 0,
-            cacheWrite: 0,
-            totalTokens: (data.usage?.input_tokens ?? 0) + (data.usage?.output_tokens ?? 0),
-            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-        };
-        const modelKey = `typesafe/${model}`;
-        const minConf = cleanNumber(node.config.minConfidence, 0, 0, 100) / 100;
+                : kind === "score"
+                  ? { type: "score", instructions, criteria: cats.map((c) => c.desc) }
+                  : {
+                        type: "choice",
+                        instructions,
+                        criteria: Object.fromEntries(cats.map((c) => [c.name, c.desc])),
+                    };
+        const { data, usageIn, usageOut } = await postClassifier(
+            isOR ? "https://openrouter.ai/api/v1/systemone" : "https://api.typesafe.ai/v1/systemone",
+            key,
+            { model, state: stateText.slice(0, 20000), questions: { q: question } },
+            isOR ? { "HTTP-Referer": "https://github.com/stilllostinla/pi-pocket-pipelines", "X-Title": "Pipelines" } : {},
+            isOR ? "OpenRouter Jev" : "Jev",
+        );
+        const answer = (data as { answers?: { q?: { type?: string; choice?: string; confidence?: number; probabilities?: Record<string, number>; noul?: number; score?: number; legend?: Record<string, string> } } }).answers?.q;
+        if (answer === undefined) throw new Error(`${isOR ? "OpenRouter Jev" : "Jev"} answered without a decision.`);
+        const usage = withUsage(usageIn, usageOut);
         if (kind === "noul") {
             const p = typeof answer.noul === "number" ? answer.noul : NaN;
-            if (!Number.isFinite(p)) throw new Error("Jev answered without a yes/no probability.");
+            if (!Number.isFinite(p)) throw new Error("The classifier answered without a yes/no probability.");
             const threshold = cleanNumber(node.config.threshold, 50, 0, 100) / 100;
             const conf = p >= threshold ? p : 1 - p;
             const text = conf < minConf ? "unsure" : p >= threshold ? "true" : "false";
             return { text, detail: `P(yes) ${(p * 100).toFixed(0)}% → ${text}`, modelKey, usage };
         }
+        if (kind === "score") {
+            const score = typeof answer.score === "number" ? answer.score : NaN;
+            const conf = typeof answer.confidence === "number" ? answer.confidence : NaN;
+            if (!Number.isFinite(score)) throw new Error("The classifier answered without a score.");
+            const cut = typeof node.config.cut === "number" ? node.config.cut : (cats.length - 1) / 2;
+            const text = Number.isFinite(conf) && conf < minConf ? "unsure" : score >= cut ? "high" : "low";
+            return { text, detail: `score ${score.toFixed(1)} → ${text}`, modelKey, usage };
+        }
         const winner = typeof answer.choice === "string" ? answer.choice : "";
         const conf = typeof answer.confidence === "number" ? answer.confidence : NaN;
-        if (winner === "" || !Number.isFinite(conf)) throw new Error("Jev answered without a category.");
+        if (winner === "" || !Number.isFinite(conf)) throw new Error("The classifier answered without a category.");
         if (conf < minConf) return { text: "unsure", detail: `best ${winner} (${(conf * 100).toFixed(0)}%) below bar`, modelKey, usage };
         const probs = Object.entries(answer.probabilities ?? {}).sort((a, b) => b[1] - a[1]);
         const runnerUp = probs.find(([name]) => name !== winner);
@@ -567,7 +687,7 @@ function runTaskFor(host: Host, web: Web) {
                         } else if (node.type === "decision") {
                             const stateText = render(cleanText(node.config.template) || "{{upstream}}", ctx);
                             if (stateText.trim() === "") throw new Error("Decision step has nothing to judge.");
-                            const decided = await jevClassify(node, stateText, run.input);
+                            const decided = await classifyDecision(node, stateText, run.input);
                             usages.push({ key: decided.modelKey, usage: decided.usage as never });
                             notes.push({ nodeId: node.id, text: `${labelOf(node)}: ${decided.detail}` });
                             out = decided.text;
@@ -911,10 +1031,24 @@ export default function createPipelines(host: Host, web: Web) {
         web.settings([
             {
                 name: "jevKey",
-                label: "Jev API key",
+                label: "Jev API key (typesafe.ai)",
                 type: "text",
                 secret: true,
-                description: "typesafe.ai key for Decision steps (Choice/Noul classifiers). Server-only: never sent to the browser.",
+                description: "Direct Jev access for Decision steps. Server-only: never sent to the browser.",
+            },
+            {
+                name: "openrouterKey",
+                label: "OpenRouter API key",
+                type: "text",
+                secret: true,
+                description: "Jev through OpenRouter for Decision steps. Server-only: never sent to the browser.",
+            },
+            {
+                name: "openaiKey",
+                label: "OpenAI API key",
+                type: "text",
+                secret: true,
+                description: "OpenAI Decisions API for Decision steps. Server-only: never sent to the browser.",
             },
         ]);
     }
@@ -1016,10 +1150,18 @@ export default function createPipelines(host: Host, web: Web) {
         };
     });
     web.route("GET", "sessions", ({ sessions }) => ({ items: sessions() }));
-    web.route("GET", "meta", () => ({
-        models: typeof host.subagentModels === "function" ? host.subagentModels() : [],
-        thinkingLevels: host.thinkingLevels ?? [],
-    }));
+    web.route("GET", "meta", () => {
+        const has = (name: string) => cleanText(typeof web.setting === "function" ? web.setting(name) : "", 500).trim() !== "";
+        return {
+            models: typeof host.subagentModels === "function" ? host.subagentModels() : [],
+            thinkingLevels: host.thinkingLevels ?? [],
+            keys: {
+                jev: has("jevKey") || (process.env.TYPESAFE_API_KEY ?? "").trim() !== "",
+                openrouter: has("openrouterKey") || (process.env.OPENROUTER_API_KEY ?? "").trim() !== "",
+                openai: has("openaiKey") || (process.env.OPENAI_API_KEY ?? "").trim() !== "",
+            },
+        };
+    });
     web.route("POST", "runs/stop", async ({ body, commit }) => {
         const id = cleanText(body.runId, 120);
         await commit(async (tx) => {
@@ -1090,7 +1232,7 @@ export default function createPipelines(host: Host, web: Web) {
     const pipePut = defineTool({
         name: "pipe_put",
         description:
-            'Create or replace a pipeline from graph JSON: {"nodes":[{"id":"in","type":"input","x":80,"y":80,"config":{"label":"Input"}},{"id":"llm1","type":"llm","x":320,"y":80,"config":{"label":"Answer","prompt":"{{upstream}}"}}],"edges":[{"id":"e1","from":"in","to":"llm1"}]}. Types: input, llm (config prompt/system/model), agent (config prompt/system-as-instructions/model/thinking; a real Pi sub-session with tools, its own transcript), prompt (config text), bash (config command/timeout; runs shell commands on the server), code (config code/timeout; JavaScript in a sandbox with input/upstream/outputs globals, no tools), branch (config template/mode/value; edges from it may set "when":"true"/"false"), decision (config kind=choice|noul, instructions, categories as "name: when it applies" lines, model default jev-latest, minConfidence 0-100, threshold 0-100 for noul; needs a Jev API key in Pipelines settings; outputs the winning category, true/false, or unsure; route with edge when set to the category name, true/false, or unsure), loop (config prompt/times/until/model), approval (config title/text/askInput/onDecline; pauses and asks a person in the run session), subpipe (config pipeline = pipeline id or name, text = its input), output (config text). Templates use {{input}}, {{upstream}}, {{Node label}}, {{node-id}}.',
+            'Create or replace a pipeline from graph JSON: {"nodes":[{"id":"in","type":"input","x":80,"y":80,"config":{"label":"Input"}},{"id":"llm1","type":"llm","x":320,"y":80,"config":{"label":"Answer","prompt":"{{upstream}}"}}],"edges":[{"id":"e1","from":"in","to":"llm1"}]}. Types: input, llm (config prompt/system/model), agent (config prompt/system-as-instructions/model/thinking; a real Pi sub-session with tools, its own transcript), prompt (config text), bash (config command/timeout; runs shell commands on the server), code (config code/timeout; JavaScript in a sandbox with input/upstream/outputs globals, no tools), branch (config template/mode/value; edges from it may set "when":"true"/"false"), decision (config provider=jev|openrouter|openai default jev, kind=choice|noul|score, instructions, categories as "name: when it applies" lines for choice / "label: description" levels for score, model default per provider, minConfidence 0-100, threshold 0-100 for noul, cut level-index for score; keys from Pipelines settings or TYPESAFE_API_KEY/OPENROUTER_API_KEY/OPENAI_API_KEY; outputs winning category, true/false, high/low, or unsure; route with edge when set to the category name, true/false, high/low, or unsure), loop (config prompt/times/until/model), approval (config title/text/askInput/onDecline; pauses and asks a person in the run session), subpipe (config pipeline = pipeline id or name, text = its input), output (config text). Templates use {{input}}, {{upstream}}, {{Node label}}, {{node-id}}.',
         parameters: Type.Object({
             name: Type.String({ description: "The pipeline's name. Same name replaces it." }),
             graphJson: Type.String({ description: "The graph as JSON, as in the description." }),

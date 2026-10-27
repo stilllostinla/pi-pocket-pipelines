@@ -44,17 +44,26 @@ Most executable steps can **continue on error**: the step outputs nothing, the f
 
 Pi can drive it too: `pipe_list`, `pipe_put` (graph JSON), `pipe_get`, `pipe_run`, `pipe_status`, `pipe_stop`.
 
-## Decision steps (Jev)
+## Decision steps (classifiers)
 
-A Decision step sends the text you point it at to [Jev](https://docs.typesafe.ai) (`POST /v1/systemone`), TypeSafe's classifier model, instead of a generative LLM:
+A Decision step sends the text you point it at to a decision model instead of a generative LLM. Three providers, one routing language:
 
-- **Choice** — you list categories as `name: when it applies` lines plus a question (“Which team should handle this?”). Jev returns the winning category with a confidence and per-category probabilities. The step outputs the winner's name, so edges with `when` set to a category route to the right path.
-- **Yes / No** — you ask a yes-no question; Jev returns P(yes). Above your threshold (default 50%) the step outputs `true`, else `false` — routed exactly like a Branch.
+| Provider | Endpoint | Models | Key |
+|---|---|---|---|
+| Jev (direct) | `POST https://api.typesafe.ai/v1/systemone` | `jev-latest` (default) | `TYPESAFE_API_KEY` |
+| Jev via OpenRouter | `POST https://openrouter.ai/api/v1/systemone` | `typesafe/jev-1.14` (default) | `OPENROUTER_API_KEY` |
+| OpenAI Decisions | `POST https://api.openai.com/v1/decisions` | `gpt-6-luna` (default) | `OPENAI_API_KEY` |
+
+- **Choice** — categories as `name: when it applies` lines plus a question. Outputs the winning category name; route edges with `when` set to a category.
+- **Yes / No** — a yes-no question + threshold (default 50%). Outputs `true`/`false`, routed like a Branch.
+- **Score** — ordered levels (`label: when it applies`, lowest first) + a cut (default: the middle). Outputs `high`/`low`; the raw score is in the run log.
 - **Unsure** — set a minimum confidence. Below it the step outputs `unsure`, which you route with an edge whose `when` is `unsure` (e.g. to a human Approval step).
 
-You need a Jev API key: **Menu → Extensions → Pipelines** (the settings form there; stored server-side, never sent to the browser), or `TYPESAFE_API_KEY` on the server. Model defaults to `jev-latest`. Jev bills input tokens only (no output-token charge); usage is counted under `typesafe/<model>` in the run session's spend ledger, with $0 cost attached — check your TypeSafe console for actual spend.
+### Credentials
 
-Rule of thumb: **Branch** for exact rules you can write down, **Decision** for judgment calls in prose (tone, topic, spam, priority) where a keyword test would be brittle.
+Keys live in **Menu → Extensions → Pipelines** (three secret fields: Jev, OpenRouter, OpenAI) or as server environment variables. Secrets stay server-side — the editor only learns *whether* a key is set, so it can warn on a Decision step that would fail. Usage tokens are counted under `typesafe/*` / `openrouter/*` / `openai/*` in the run session's spend ledger (cost attached as $0 — check your provider console for actual spend).
+
+Rule of thumb: **Branch** for exact rules you can write down, **Decision** for judgment calls in prose (tone, topic, spam, severity) where a keyword test would be brittle.
 
 ## Durability
 

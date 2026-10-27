@@ -1,0 +1,9 @@
+{
+    "name": "pipelines-tests",
+    "private": true,
+    "type": "module",
+    "description": "Test-only dependencies for the pipelines extension (jsdom). Not part of the extension.",
+    "dependencies": {
+        "jsdom": "^25.0.0"
+    }
+}

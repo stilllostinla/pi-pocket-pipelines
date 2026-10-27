@@ -1,0 +1,37 @@
+.pipe-wrap { display: flex; flex-direction: column; gap: 10px; padding: 4px 2px 20px; }
+.pipe-bar { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.pipe-in { background: var(--card); color: var(--text); border: 1px solid var(--line); border-radius: 8px; padding: 7px 9px; font: inherit; min-width: 0; }
+.pipe-in.grow, .grow { flex: 1; }
+.pipe-add { display: inline-flex; gap: 6px; align-items: center; }
+.pdot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; flex: none; }
+.pipe-canvas {
+    position: relative; height: 480px; overflow: hidden; border: 1px solid var(--line); border-radius: 12px;
+    background:
+        radial-gradient(circle, var(--line) 1px, transparent 1px);
+    background-size: 24px 24px; background-color: var(--bg);
+    touch-action: none; cursor: grab;
+}
+.pipe-world { position: absolute; left: 0; top: 0; transform-origin: 0 0; }
+.pipe-edges { position: absolute; left: 0; top: 0; overflow: visible; }
+.pedge { fill: none; stroke-width: 2.5; pointer-events: stroke; cursor: pointer; }
+.pedge.sel { stroke: var(--accent) !important; stroke-width: 3.5; }
+.pnode {
+    position: absolute; width: 176px; min-height: 60px; box-sizing: border-box;
+    background: var(--card); color: var(--text); border: 2px solid var(--line); border-radius: 12px;
+    padding: 8px 10px; cursor: grab; user-select: none; -webkit-user-select: none; touch-action: none;
+    box-shadow: 0 2px 10px rgba(0,0,0,.18);
+}
+.pnode.sel { outline: 2px solid var(--accent); outline-offset: 1px; }
+.pnode-head { display: flex; gap: 6px; align-items: center; }
+.pnode-head b { font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pnode-sub { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-top: 3px; }
+.pport { position: absolute; top: 24px; width: 16px; height: 16px; border-radius: 50%; background: var(--bg); border: 3px solid var(--accent); cursor: pointer; z-index: 2; }
+.pport.in { left: -9px; }
+.pport.out { right: -9px; }
+.pipe-props { border: 1px solid var(--line); border-radius: 12px; padding: 10px; display: flex; flex-direction: column; gap: 8px; background: var(--card); }
+.pipe-field { display: flex; flex-direction: column; gap: 4px; font-size: 13px; color: var(--muted); }
+.pipe-field .pipe-in { width: 100%; box-sizing: border-box; padding: 10px; font-size: 16px; }
+.pipe-field textarea.pipe-in { line-height: 1.45; }
+.pipe-runs { display: flex; flex-direction: column; gap: 6px; }
+.pipe-run-detail { padding: 4px 2px 10px 8px; }
+.pipe-out { white-space: pre-wrap; word-break: break-word; background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 8px; font-size: 12px; max-height: 300px; overflow: auto; }

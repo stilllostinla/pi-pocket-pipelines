@@ -1,0 +1,4 @@
+node_modules
+_pocket.d.ts
+tests/node_modules/
+*.log

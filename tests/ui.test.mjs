@@ -65,7 +65,7 @@ const field = (label) => [...$$(".pipe-props")[0].querySelectorAll(".pipe-field"
 let firstNode = $$(".pnode").find(n => n.textContent.includes("Answer"));
 await act(async () => { firstNode.dispatchEvent(new dom.window.MouseEvent("pointerdown", { bubbles: true })); await new Promise(r => setTimeout(r, 30)); });
 check("starter node props open with an Edit step heading", ($$(".pipe-props")[0]?.textContent || "").includes("Edit step"));
-await typeText(field("Label")?.querySelector("input"), "Renamed", dom.window.HTMLInputElement);
+await typeText(field("Step name")?.querySelector("input"), "Renamed", dom.window.HTMLInputElement);
 check("starter step renames", $$(".pnode").some(n => n.textContent.includes("Renamed")));
 await typeText(field("Prompt")?.querySelector("textarea"), "prompt {{input}}", dom.window.HTMLTextAreaElement);
 check("starter prompt edits", field("Prompt")?.querySelector("textarea")?.value === "prompt {{input}}");
@@ -77,14 +77,14 @@ await act(async () => { sel.value = "d1"; sel.dispatchEvent(new dom.window.Event
 const loaded = $$(".pnode").find(n => n.textContent.includes("LoadedAnswer"));
 check("loaded pipeline renders its nodes", !!loaded);
 await act(async () => { loaded.dispatchEvent(new dom.window.MouseEvent("pointerdown", { bubbles: true })); await new Promise(r => setTimeout(r, 30)); });
-await typeText(field("Label")?.querySelector("input"), "LoadedRenamed", dom.window.HTMLInputElement);
+await typeText(field("Step name")?.querySelector("input"), "LoadedRenamed", dom.window.HTMLInputElement);
 await typeText(field("Prompt")?.querySelector("textarea"), "new prompt {{input}}", dom.window.HTMLTextAreaElement);
 check("loaded step renames", $$(".pnode").some(n => n.textContent.includes("LoadedRenamed")));
 
 // C: new node from palette
 await click($$(".pipe-add").find(b => b.textContent.includes("Prompt")));
 await flush(30);
-await typeText(field("Label")?.querySelector("input"), "MyPromptStep", dom.window.HTMLInputElement);
+await typeText(field("Step name")?.querySelector("input"), "MyPromptStep", dom.window.HTMLInputElement);
 await typeText(field("Text")?.querySelector("textarea"), "Summarize: {{upstream}}", dom.window.HTMLTextAreaElement);
 check("new step renames + takes text", $$(".pnode").some(n => n.textContent.includes("MyPromptStep")));
 

@@ -290,7 +290,7 @@ export default function setup(pocket) {
             ${node ? html`<div class="pipe-props" ref=${propsRef}>
                 <div class="setting"><div class="grow"><b>✎ Edit step — ${labelOf(node)}</b> <span class="muted small">${node.type} · ${node.id}</span></div>
                 <button class="button" onClick=${() => { patchNode(node.id, { x: node.x, y: node.y }); setGraph((g) => ({ nodes: g.nodes.filter((n) => n.id !== node.id), edges: g.edges.filter((e) => e.from !== node.id && e.to !== node.id) })); setSelNode(null); }}>Delete node</button></div>
-                <label class="pipe-field">Label<input class="pipe-in" value=${node.config.label || ""} onInput=${(e) => patchConfig(node.id, "label", e.target.value)} /></label>
+                <label class="pipe-field">Step name — this card's title; other steps read its output as {{name}}<input class="pipe-in" value=${node.config.label || ""} onInput=${(e) => patchConfig(node.id, "label", e.target.value)} placeholder=${node.type} /></label>
                 ${node.type === "llm" || node.type === "loop" || node.type === "agent" ? html`
                     <label class="pipe-field">Model (blank = run session's model)
                         <select class="pipe-in" value=${node.config.model || ""} onChange=${(e) => patchConfig(node.id, "model", e.target.value)}>
@@ -306,12 +306,12 @@ export default function setup(pocket) {
                 ${node.type === "llm" || node.type === "agent" ? html`<label class="pipe-field">Prompt<textarea class="pipe-in" rows="5" value=${node.config.prompt || ""} onInput=${(e) => patchConfig(node.id, "prompt", e.target.value)}></textarea></label>` : null}
                 ${node.type === "loop" ? html`
                     <label class="pipe-field">Prompt ({{prev}} = last round)<textarea class="pipe-in" rows="5" value=${node.config.prompt || ""} onInput=${(e) => patchConfig(node.id, "prompt", e.target.value)}></textarea></label>
-                    <label class="pipe-field">Rounds<input class="pipe-in" type="number" min="1" max="20" value=${node.config.times || 3} onInput=${(e) => patchConfig(node.id, "times", Number(e.target.value))} /></label>
+                    <label class="pipe-field">Rounds<input class="pipe-in" type="number" min="1" max="20" value=${node.config.times ?? 3} onInput=${(e) => patchConfig(node.id, "times", e.target.value === "" ? "" : Number(e.target.value))} /></label>
                     <label class="pipe-field">Stop early when output contains<input class="pipe-in" value=${node.config.until || ""} onInput=${(e) => patchConfig(node.id, "until", e.target.value)} /></label>` : null}
                 ${node.type === "prompt" || node.type === "output" ? html`<label class="pipe-field">Text<textarea class="pipe-in" rows="5" value=${node.config.text || ""} onInput=${(e) => patchConfig(node.id, "text", e.target.value)}></textarea></label>` : null}
                 ${node.type === "bash" ? html`
                     <label class="pipe-field">Command (runs in the run session's folder)<textarea class="pipe-in" rows="4" value=${node.config.command || ""} onInput=${(e) => patchConfig(node.id, "command", e.target.value)}></textarea></label>
-                    <label class="pipe-field">Timeout (seconds)<input class="pipe-in" type="number" min="1" max="600" value=${node.config.timeout || 120} onInput=${(e) => patchConfig(node.id, "timeout", Number(e.target.value))} /></label>` : null}
+                    <label class="pipe-field">Timeout (seconds)<input class="pipe-in" type="number" min="1" max="600" value=${node.config.timeout ?? 120} onInput=${(e) => patchConfig(node.id, "timeout", e.target.value === "" ? "" : Number(e.target.value))} /></label>` : null}
                 ${node.type === "branch" ? html`
                     <label class="pipe-field">Test this text<textarea class="pipe-in" rows="3" value=${node.config.template || ""} onInput=${(e) => patchConfig(node.id, "template", e.target.value)}></textarea></label>
                     <label class="pipe-field">Mode<select class="pipe-in" value=${node.config.mode || "contains"} onChange=${(e) => patchConfig(node.id, "mode", e.target.value)}>
@@ -320,7 +320,7 @@ export default function setup(pocket) {
                     <p class="muted small">Then tap each edge leaving this node and set it to “when true” or “when false”.</p>` : null}
                 ${node.type === "code" ? html`
                     <label class="pipe-field">JavaScript — globals: input, upstream, outputs (by node id). Return a value, or console.log it. No tools, files, or network.<textarea class="pipe-in mono" rows="8" value=${node.config.code || ""} onInput=${(e) => patchConfig(node.id, "code", e.target.value)}></textarea></label>
-                    <label class="pipe-field">Timeout (seconds, max 60)<input class="pipe-in" type="number" min="1" max="60" value=${node.config.timeout || 10} onInput=${(e) => patchConfig(node.id, "timeout", Number(e.target.value))} /></label>` : null}
+                    <label class="pipe-field">Timeout (seconds, max 60)<input class="pipe-in" type="number" min="1" max="60" value=${node.config.timeout ?? 10} onInput=${(e) => patchConfig(node.id, "timeout", e.target.value === "" ? "" : Number(e.target.value))} /></label>` : null}
                 ${node.type === "approval" ? html`
                     <label class="pipe-field">Card title<input class="pipe-in" value=${node.config.title || ""} onInput=${(e) => patchConfig(node.id, "title", e.target.value)} /></label>
                     <label class="pipe-field">Card text<textarea class="pipe-in" rows="4" value=${node.config.text || ""} onInput=${(e) => patchConfig(node.id, "text", e.target.value)}></textarea></label>
@@ -371,9 +371,9 @@ export default function setup(pocket) {
                         ${r.status === "queued" || r.status === "running" ? html`<button class="button" onClick=${() => stopRun(r.id)}>Stop</button>` : null}
                     </div>
                     ${openRun === r.id ? html`<div class="pipe-run-detail">
-                        ${r.agentSessions ? Object.entries(r.agentSessions).map(([nid2, cid]) => html`<p class="small">Agent node ${nid2}: <button class="button" onClick=${() => typeof pocket.openConversation === "function" && pocket.openConversation(cid)}>Open sub-session ${cid}</button></p>`) : null}
+                        ${r.agentSessions ? Object.entries(r.agentSessions).map(([nid2, cid]) => { const src = ((r.graph && r.graph.nodes) || []).find((x) => x.id === nid2); return html`<p class="small">Agent step ${src && src.config && src.config.label ? `"${src.config.label}" ` : ""}${nid2}: <button class="button" onClick=${() => typeof pocket.openConversation === "function" && pocket.openConversation(cid)}>Open sub-session ${cid}</button></p>`; }) : null}
                         ${r.parentRunId ? html`<p class="muted small">Sub-run of ${r.parentRunId}</p>` : null}
-                        ${Object.entries(r.outputs || {}).map(([id, text]) => html`<div><b class="small">${id}</b><pre class="pipe-out">${String(text).slice(0, 4000)}</pre></div>`)}
+                        ${Object.entries(r.outputs || {}).map(([id, text]) => { const src = ((r.graph && r.graph.nodes) || []).find((x) => x.id === id); const title = (src && src.config && src.config.label) || id; return html`<div><b class="small">${title}</b><pre class="pipe-out">${String(text).slice(0, 4000)}</pre></div>`; })}
                         ${(r.skipped || []).length ? html`<p class="muted small">Skipped: ${r.skipped.join(", ")}</p>` : null}
                         ${r.failedNodes && Object.keys(r.failedNodes).length ? html`<p class="small" style="color:var(--warn)">Failed but continued: ${Object.entries(r.failedNodes).map(([id, e]) => `${id}: ${e}`).join("; ")}</p>` : null}
                         <pre class="pipe-out">${(r.log || []).map((l) => l.text).join("\n")}</pre>

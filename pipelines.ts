@@ -8,8 +8,15 @@
  * ask a person in the run's session; Code nodes run JavaScript in the codemode sandbox with no tools; Shell nodes
  * run shell commands in the run session's folder on this server — treat a saved pipeline like a script you would
  * run yourself. Pi can also list, create, run, and check pipelines with the pipe_* tools.
+ *
+ * Decision steps authenticate to classifier APIs with keys from Pipelines settings, the owner's Secrets catalog
+ * (Menu → Secrets), or server environment variables, in that order. Catalog secrets keep their rules: ask-gated
+ * secrets are refused (Decision steps run unattended), folder limits and the owner-only rule apply. Key values are
+ * used only in HTTPS Authorization headers and are never stored, logged, or shown.
  */
 import { randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { Type } from "@earendil-works/pi-ai";
 import { CodemodeSandbox } from "@earendil-works/pi-codemode";
 import {
@@ -279,7 +286,136 @@ const textOf = (reply: { content: readonly { type: string; text?: string }[] }):
 type RunInput = { runId: string };
 type RunState = { phase: "step"; step: number };
 
-function runTaskFor(host: Host, web: Web) {
+function makeCredentials(host: Host, web: Web) {
+/**
+ * The credentials store: server-side keys for each classifier provider.
+ * Order: Pipelines settings → owner's Secrets catalog → server environment.
+ * The catalog keeps its rules: ask-gated secrets are refused (Decision steps run
+ * unattended), folder limits and the owner-only rule apply.
+ */
+const CATALOG_NAMES = {
+    jev: ["TYPESAFE_API_KEY", "JEV_API_KEY"],
+    openrouter: ["OPENROUTER_API_KEY", "OPENROUTER"],
+    openai: ["OPENAI_API_KEY", "OPENAI"],
+} as const;
+
+type CatalogEntry = { value: string; folders: string[]; guests: boolean; ask: boolean };
+
+function readCatalog(): { owner?: string; items: Map<string, CatalogEntry> } {
+    const empty = { items: new Map<string, CatalogEntry>() };
+    try {
+        const dir = (host as { dataDir?: unknown }).dataDir;
+        if (typeof dir !== "string" || dir === "") return empty;
+        const raw = readFileSync(join(dir, "secrets", "secrets.json"), "utf8");
+        const parsed = JSON.parse(raw) as {
+            owner?: unknown;
+            secrets?: Record<string, { value?: unknown; folders?: unknown; guests?: unknown; ask?: unknown }>;
+        };
+        const items = parsed?.secrets;
+        if (typeof items !== "object" || items === null || Array.isArray(items)) return empty;
+        const out: { owner?: string; items: Map<string, CatalogEntry> } = {
+            items: new Map(),
+            ...(typeof parsed.owner === "string" ? { owner: parsed.owner } : {}),
+        };
+        for (const [name, item] of Object.entries(items)) {
+            if (/^[A-Z_][A-Z0-9_]{0,63}$/.test(name) && typeof item?.value === "string" && item.value !== "") {
+                out.items.set(name, {
+                    value: item.value,
+                    folders: Array.isArray(item.folders) ? item.folders.filter((f): f is string => typeof f === "string") : [],
+                    guests: item.guests === true,
+                    ask: item.ask === true,
+                });
+            }
+        }
+        return out;
+    } catch {
+        return empty;
+    }
+}
+
+const within = (cwd: string, folder: string) =>
+    cwd === folder || cwd.startsWith(folder.endsWith("/") ? folder : `${folder}/`);
+
+const hiddenKeys = new Set<string>();
+const hiddenStoppers: (() => void)[] = [];
+web.onDispose(() => {
+    for (const stop of hiddenStoppers.splice(0)) {
+        try {
+            stop();
+        } catch {
+            /* already gone */
+        }
+    }
+});
+
+/** Mask a key everywhere Pi and people read, so it can never leak by accident. */
+function keepHidden(value: string, label: string) {
+    if (value === "" || hiddenKeys.has(value) || hiddenKeys.size >= 200) return;
+    if (typeof host.hide !== "function") return;
+    try {
+        hiddenStoppers.push(host.hide({ value, label: `secret ${label.slice(0, 52)}` }));
+        hiddenKeys.add(value);
+    } catch {
+        /* hiding is best-effort; the key still never enters any text we produce */
+    }
+}
+
+async function resolveClassifierKey(
+    provider: "jev" | "openrouter" | "openai",
+    runtime: { agent: (c: never) => Promise<{ cwd?: string }> },
+    context: never,
+    conversationId: number,
+): Promise<string> {
+    const settingName = provider === "jev" ? "jevKey" : provider === "openrouter" ? "openrouterKey" : "openaiKey";
+    const fromSetting = typeof web.setting === "function" ? cleanText(web.setting(settingName), 500).trim() : "";
+    if (fromSetting !== "") {
+        keepHidden(fromSetting, settingName);
+        return fromSetting;
+    }
+    const catalog = readCatalog();
+    for (const name of CATALOG_NAMES[provider]) {
+        const entry = catalog.items.get(name);
+        if (entry === undefined) continue;
+        if (entry.ask) {
+            throw new Error(
+                `Secret $${name} waits for a person to allow each use. Decision steps run on their own: turn off “ask each use” for pipeline keys, or paste the key in Pipelines settings.`,
+            );
+        }
+        if (entry.folders.length > 0) {
+            const cwd = (await runtime.agent(context)).cwd ?? process.cwd();
+            if (!entry.folders.some((f) => within(cwd, f))) {
+                throw new Error(`Secret $${name} may be used only in ${entry.folders.join(", ")}.`);
+            }
+        }
+        if (!entry.guests) {
+            const by = typeof host.requesterOf === "function" ? host.requesterOf(conversationId as never) : undefined;
+            if (by !== undefined && catalog.owner !== undefined && by !== catalog.owner) {
+                throw new Error(`Secret $${name} is the owner's: Decision steps using it run only for the owner.`);
+            }
+            if (by !== undefined && catalog.owner === undefined) {
+                throw new Error(`Secret $${name} waits until the owner opens Pi Pocket once with Secrets on.`);
+            }
+        }
+        keepHidden(entry.value, name);
+        return entry.value;
+    }
+    const envName = provider === "jev" ? "TYPESAFE_API_KEY" : provider === "openrouter" ? "OPENROUTER_API_KEY" : "OPENAI_API_KEY";
+    return (process.env[envName] ?? "").trim();
+}
+
+/** Whether any source holds a key for this provider (settings, catalog, or environment). */
+function hasKey(provider: "jev" | "openrouter" | "openai"): boolean {
+    const settingName = provider === "jev" ? "jevKey" : provider === "openrouter" ? "openrouterKey" : "openaiKey";
+    if (typeof web.setting === "function" && cleanText(web.setting(settingName), 500).trim() !== "") return true;
+    const catalog = readCatalog();
+    if (CATALOG_NAMES[provider].some((n) => catalog.items.has(n))) return true;
+    const envName = provider === "jev" ? "TYPESAFE_API_KEY" : provider === "openrouter" ? "OPENROUTER_API_KEY" : "OPENAI_API_KEY";
+    return (process.env[envName] ?? "").trim() !== "";
+}
+    return { resolveClassifierKey, hasKey };
+}
+
+function runTaskFor(host: Host, web: Web, creds: Pick<ReturnType<typeof makeCredentials>, "resolveClassifierKey">) {
     /** The model a node runs on: its own choice, or the run session's, checked against the owner's list. */
     async function resolveRef(
         runtime: { agent: (c: never) => Promise<{ model?: { provider: string; modelId: string } }>; conversationId: number },
@@ -339,14 +475,6 @@ function runTaskFor(host: Host, web: Web) {
     }
 
     /** The credentials store: server-side keys for each classifier provider. Settings first, environment fallback. */
-    function credential(provider: "jev" | "openrouter" | "openai"): string {
-        const fromSetting = (name: string) =>
-            typeof web.setting === "function" ? cleanText(web.setting(name), 500).trim() : "";
-        const env = (typeof process !== "undefined" ? process.env : {}) as Record<string, string | undefined>;
-        if (provider === "jev") return fromSetting("jevKey") || (env.TYPESAFE_API_KEY ?? "").trim();
-        if (provider === "openrouter") return fromSetting("openrouterKey") || (env.OPENROUTER_API_KEY ?? "").trim();
-        return fromSetting("openaiKey") || (env.OPENAI_API_KEY ?? "").trim();
-    }
 
     type Classified = {
         text: string;
@@ -390,9 +518,16 @@ function runTaskFor(host: Host, web: Web) {
      * Noul/predicate answers yes/no (outputs true/false), Score rates against ordered levels (outputs high/low).
      * Below the confidence bar the step outputs unsure, for an edge to route to review.
      */
-    async function classifyDecision(node: PipeNode, stateText: string, runInput: string): Promise<Classified> {
+    async function classifyDecision(
+        node: PipeNode,
+        stateText: string,
+        runInput: string,
+        runtime: { agent: (c: never) => Promise<{ cwd?: string }> },
+        context: never,
+        conversationId: number,
+    ): Promise<Classified> {
         const provider = (cleanText(node.config.provider, 20) || "jev") as "jev" | "openrouter" | "openai";
-        const key = credential(provider);
+        const key = await creds.resolveClassifierKey(provider, runtime, context, conversationId);
         if (key === "") {
             const hint =
                 provider === "jev"
@@ -401,7 +536,7 @@ function runTaskFor(host: Host, web: Web) {
                       ? "OPENROUTER_API_KEY"
                       : "OPENAI_API_KEY";
             throw new Error(
-                `Decision steps on ${provider} need an API key: set it in Pipelines settings (Menu → Extensions → Pipelines), or ${hint} on the server.`,
+                `Decision steps on ${provider} need an API key: add it to the Secrets catalog (Menu → Secrets, e.g. $${hint.replace("_API_KEY", "")}), Pipelines settings, or ${hint} on the server.`,
             );
         }
         const kind = cleanText(node.config.kind, 20) || "choice";
@@ -687,7 +822,7 @@ function runTaskFor(host: Host, web: Web) {
                         } else if (node.type === "decision") {
                             const stateText = render(cleanText(node.config.template) || "{{upstream}}", ctx);
                             if (stateText.trim() === "") throw new Error("Decision step has nothing to judge.");
-                            const decided = await classifyDecision(node, stateText, run.input);
+                            const decided = await classifyDecision(node, stateText, run.input, runtime as never, context as never, run.conversationId);
                             usages.push({ key: decided.modelKey, usage: decided.usage as never });
                             notes.push({ nodeId: node.id, text: `${labelOf(node)}: ${decided.detail}` });
                             out = decided.text;
@@ -1025,7 +1160,8 @@ function runTaskFor(host: Host, web: Web) {
 // ─── Module ──────────────────────────────────────────────────────────────────
 
 export default function createPipelines(host: Host, web: Web) {
-    const RunTask = runTaskFor(host, web);
+    const creds = makeCredentials(host, web);
+    const RunTask = runTaskFor(host, web, creds);
 
     if (typeof web.settings === "function") {
         web.settings([
@@ -1151,14 +1287,13 @@ export default function createPipelines(host: Host, web: Web) {
     });
     web.route("GET", "sessions", ({ sessions }) => ({ items: sessions() }));
     web.route("GET", "meta", () => {
-        const has = (name: string) => cleanText(typeof web.setting === "function" ? web.setting(name) : "", 500).trim() !== "";
         return {
             models: typeof host.subagentModels === "function" ? host.subagentModels() : [],
             thinkingLevels: host.thinkingLevels ?? [],
             keys: {
-                jev: has("jevKey") || (process.env.TYPESAFE_API_KEY ?? "").trim() !== "",
-                openrouter: has("openrouterKey") || (process.env.OPENROUTER_API_KEY ?? "").trim() !== "",
-                openai: has("openaiKey") || (process.env.OPENAI_API_KEY ?? "").trim() !== "",
+                jev: creds.hasKey("jev"),
+                openrouter: creds.hasKey("openrouter"),
+                openai: creds.hasKey("openai"),
             },
         };
     });

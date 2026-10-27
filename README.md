@@ -61,7 +61,13 @@ A Decision step sends the text you point it at to a decision model instead of a 
 
 ### Credentials
 
-Keys live in **Menu → Extensions → Pipelines** (three secret fields: Jev, OpenRouter, OpenAI) or as server environment variables. Secrets stay server-side — the editor only learns *whether* a key is set, so it can warn on a Decision step that would fail. Usage tokens are counted under `typesafe/*` / `openrouter/*` / `openai/*` in the run session's spend ledger (cost attached as $0 — check your provider console for actual spend).
+Keys are resolved per provider in this order, at run time:
+
+1. **Pipelines settings** — Menu → Extensions → Pipelines (three secret fields: Jev, OpenRouter, OpenAI).
+2. **Secrets catalog** — Menu → Secrets, named `TYPESAFE_API_KEY` / `JEV_API_KEY`, `OPENROUTER_API_KEY` / `OPENROUTER`, `OPENAI_API_KEY` / `OPENAI`. The catalog keeps its rules: ask-gated secrets are refused (Decision steps run unattended — turn off “ask each use” for pipeline keys), folder limits and the owner-only rule apply.
+3. **Server environment** — `TYPESAFE_API_KEY`, `OPENROUTER_API_KEY`, `OPENAI_API_KEY`.
+
+Key values are used only in HTTPS `Authorization` headers. They are never stored in pipeline data, never logged, never shown — and each distinct value is additionally masked everywhere Pi and people read, so it cannot leak by accident. The editor only learns *whether* a key exists, and warns on a Decision step whose provider has none. Usage tokens are counted under `typesafe/*` / `openrouter/*` / `openai/*` in the run session's spend ledger (cost attached as $0 — check your provider console for actual spend).
 
 Rule of thumb: **Branch** for exact rules you can write down, **Decision** for judgment calls in prose (tone, topic, spam, severity) where a keyword test would be brittle.
 

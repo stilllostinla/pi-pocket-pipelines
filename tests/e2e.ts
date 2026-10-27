@@ -41,6 +41,7 @@ const web = {
     send: () => {},
     error: (s: number, m: string) => Object.assign(new Error(m), { status: s }),
     onDispose: () => {},
+    setting: (name: string) => (globalThis as { __pipeSettings?: Record<string, string> }).__pipeSettings?.[name],
 } as never;
 const ext = createPipelines(host, web) as unknown as {
     tools: { name: string; execute: (args: never, api: never, ctx: never) => Promise<{ output: { text: string }[] }> }[];
@@ -72,6 +73,19 @@ const check = (name: string, cond: boolean) => {
     if (!cond) fails.push(name);
 };
 let seq = 0;
+
+// Fake Secrets catalog under a temp dataDir: settings → catalog → env precedence.
+import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join as joinPath } from "node:path";
+const fakeDataDir = mkdtempSync(joinPath(tmpdir(), "pipe-secrets-"));
+mkdirSync(joinPath(fakeDataDir, "secrets"), { recursive: true });
+const catalogFile = joinPath(fakeDataDir, "secrets", "secrets.json");
+const writeCatalog = (secrets: Record<string, { value: string; ask?: boolean; guests?: boolean; folders?: string[] }>) =>
+    writeFileSync(catalogFile, JSON.stringify({ owner: "u1", secrets }));
+writeCatalog({});
+(host as { dataDir?: string }).dataDir = fakeDataDir;
+(globalThis as { __pipeSettings?: Record<string, string> }).__pipeSettings = {};
 async function put(name: string, graph: unknown) {
     seq++;
     await tool("pipe_put").execute({ name, graphJson: JSON.stringify(graph) } as never, api(seq, `p${seq}`), context as never);
@@ -398,6 +412,52 @@ try {
     threwScore = e instanceof Error ? e.message : String(e);
 }
 check("score with one level is refused", threwScore.includes("at least 2 levels"));
+
+// 11. Secrets catalog: settings → catalog → env; gating honored.
+delete process.env.TYPESAFE_API_KEY;
+delete process.env.OPENROUTER_API_KEY;
+delete process.env.OPENAI_API_KEY;
+const catalogChoice = {
+    model: "typesafe/jev-1.14",
+    answers: { q: { type: "choice", choice: "billing", confidence: 0.9, probabilities: { billing: 0.9 } } },
+    usage: { input_tokens: 5, output_tokens: 1 },
+};
+await put("CatPipe", {
+    nodes: [
+        { id: "in", type: "input", x: 0, y: 0, config: { label: "Input" } },
+        { id: "d", type: "decision", x: 0, y: 0, config: { label: "Route", provider: "openrouter", kind: "choice", template: "{{upstream}}", instructions: "Which team?", categories: "billing: money\ntechnical: broken" } },
+        { id: "out", type: "output", x: 0, y: 0, config: { label: "Output", text: "{{upstream}}" } },
+    ],
+    edges: [{ id: "m1", from: "in", to: "d" }, { id: "m2", from: "d", to: "out", when: "billing" }],
+});
+writeCatalog({ OPENROUTER: { value: "catalog-or-key" } });
+fetchQueue.push(catalogChoice);
+const cat = await runPipe("CatPipe", "bill me");
+check("catalog short name authenticates", cat.includes("· done") && fetchCalls[fetchCalls.length - 1]?.auth === "Bearer catalog-or-key");
+
+(globalThis as { __pipeSettings?: Record<string, string> }).__pipeSettings = { openrouterKey: "setting-or-key" };
+process.env.OPENROUTER_API_KEY = "env-or-key";
+fetchQueue.push(catalogChoice);
+await runPipe("CatPipe", "bill me");
+check("settings beat catalog and env", fetchCalls[fetchCalls.length - 1]?.auth === "Bearer setting-or-key");
+(globalThis as { __pipeSettings?: Record<string, string> }).__pipeSettings = {};
+fetchQueue.push(catalogChoice);
+await runPipe("CatPipe", "bill me");
+check("catalog beats env", fetchCalls[fetchCalls.length - 1]?.auth === "Bearer catalog-or-key");
+writeCatalog({});
+fetchQueue.push(catalogChoice);
+await runPipe("CatPipe", "bill me");
+check("env is the last resort", fetchCalls[fetchCalls.length - 1]?.auth === "Bearer env-or-key");
+delete process.env.OPENROUTER_API_KEY;
+
+writeCatalog({ OPENROUTER_API_KEY: { value: "gated", ask: true } });
+const gated = await runPipe("CatPipe", "bill me");
+check("ask-gated secret is refused", gated.includes("· failed") && gated.includes("allow each use"));
+
+writeCatalog({ OPENROUTER_API_KEY: { value: "fenced", folders: ["/nonexistent-folder"] } });
+const fenced = await runPipe("CatPipe", "bill me");
+check("folder-limited secret is refused outside its folders", fenced.includes("· failed") && fenced.includes("may be used only in"));
+writeCatalog({});
 
 console.log(fails.length ? `E2E-FAIL (${fails.length})` : "E2E-OK");
 await harness.close(context);

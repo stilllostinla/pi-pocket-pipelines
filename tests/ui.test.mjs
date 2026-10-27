@@ -163,7 +163,7 @@ const dNode2 = $$(".pnode").find(n => n.textContent.includes("Decision"));
 await act(async () => { dNode2.dispatchEvent(new dom.window.MouseEvent("pointerdown", { bubbles: true })); await new Promise(r => setTimeout(r, 30)); });
 await selectOption(field("Classifier")?.querySelector("select"), "openai");
 await selectOption(field("Judge")?.querySelector("select"), "score");
-check("provider switch warns without a key", ($$(".pipe-props")[0]?.textContent || "").includes("No key saved"));
+check("provider switch warns without a key", ($$(".pipe-props")[0]?.textContent || "").includes("No key found"));
 await typeText(field("Question")?.querySelector("textarea"), "How severe?", dom.window.HTMLTextAreaElement);
 await typeText(field("Levels")?.querySelector("textarea"), "low: minor\nmid: workaround\nhigh: blocked", dom.window.HTMLTextAreaElement);
 const cutInput = field("High at score")?.querySelector("input");

@@ -93,7 +93,7 @@ const RunsDoc = defineDoc<{ items: Record<string, PipeRun> }>({
 
 // ─── Graph helpers ───────────────────────────────────────────────────────────
 
-const NODE_TYPES = ["input", "llm", "agent", "prompt", "bash", "code", "branch", "loop", "approval", "subpipe", "output"];
+const NODE_TYPES = ["input", "llm", "agent", "prompt", "bash", "code", "branch", "decision", "loop", "approval", "subpipe", "output"];
 const MAX_NODES = 100;
 const MAX_EDGES = 300;
 const MAX_TEXT = 20_000;
@@ -126,13 +126,26 @@ function sanitizeGraph(raw: unknown): PipeGraph {
         if (!NODE_TYPES.includes(type)) throw new Error(`Unknown node type ${type || "(blank)"}.`);
         const configIn = (node.config ?? {}) as Record<string, unknown>;
         const config: Record<string, unknown> = { label: cleanText(configIn.label, 120) };
-        for (const key of ["prompt", "system", "text", "template", "command", "value", "until", "model", "code", "title", "thinking", "pipeline", "onDecline", "onError"]) {
+        for (const key of ["prompt", "system", "text", "template", "command", "value", "until", "model", "code", "title", "thinking", "pipeline", "onDecline", "onError", "kind", "categories", "instructions"]) {
             if (configIn[key] !== undefined) config[key] = cleanText(configIn[key]);
         }
+        if (configIn.minConfidence !== undefined) config.minConfidence = cleanNumber(configIn.minConfidence, 0, 0, 100);
+        if (configIn.threshold !== undefined) config.threshold = cleanNumber(configIn.threshold, 50, 0, 100);
         if (configIn.askInput !== undefined) config.askInput = configIn.askInput === true;
         if (configIn.mode !== undefined) config.mode = cleanText(configIn.mode, 40);
         if (configIn.times !== undefined) config.times = cleanNumber(configIn.times, 3, 1, 20);
         if (configIn.timeout !== undefined) config.timeout = cleanNumber(configIn.timeout, 120, 1, 600);
+        if (type === "decision") {
+            const kind = cleanText(config.kind, 20) || "choice";
+            if (kind !== "choice" && kind !== "noul") throw new Error(`Decision step ${id} has kind ${kind || "(blank)"}: use choice or noul.`);
+            config.kind = kind;
+            if (cleanText(config.instructions, 2000).trim() === "") throw new Error(`Decision step ${id} needs instructions (the question Jev should judge).`);
+            if (kind === "choice") {
+                const cats = parseCategories(cleanText(config.categories, 8000));
+                if (cats.length === 0) throw new Error(`Decision step ${id} needs at least one category ("name: when it applies", one per line).`);
+                config.categories = cats.map((c) => `${c.name}: ${c.desc}`).join("\n");
+            }
+        }
         return {
             id,
             type,
@@ -149,12 +162,12 @@ function sanitizeGraph(raw: unknown): PipeGraph {
         const from = cleanText(edge.from, 80);
         const to = cleanText(edge.to, 80);
         if (!ids.has(from) || !ids.has(to) || from === to) continue;
-        const when = cleanText(edge.when, 10);
+        const when = cleanText(edge.when, 80);
         edges.push({
             id: cleanText(edge.id, 80) || `e${edges.length + 1}`,
             from,
             to,
-            ...(when === "true" || when === "false" ? { when } : {}),
+            ...(when === "" ? {} : { when }),
         });
     }
     return { nodes, edges };
@@ -162,6 +175,27 @@ function sanitizeGraph(raw: unknown): PipeGraph {
 
 function labelOf(node: PipeNode): string {
     return cleanText(node.config.label, 120) || node.type;
+}
+
+/** One "name: when it applies" line per category, for Decision (choice) steps. */
+function parseCategories(text: string): { name: string; desc: string }[] {
+    const out: { name: string; desc: string }[] = [];
+    for (const line of text.split("\n")) {
+        const t = line.trim();
+        if (t === "" || t.startsWith("#")) continue;
+        const colon = t.indexOf(":");
+        const name = (colon < 0 ? t : t.slice(0, colon)).trim().slice(0, 80);
+        const desc = (colon < 0 ? "" : t.slice(colon + 1)).trim().slice(0, 2000);
+        if (name === "") continue;
+        out.push({ name, desc: desc || name });
+    }
+    const seen = new Set<string>();
+    for (const c of out) {
+        if (seen.has(c.name)) throw new Error(`Two categories named ${c.name}.`);
+        seen.add(c.name);
+    }
+    if (out.length > 64) throw new Error("At most 64 categories.");
+    return out;
 }
 
 function hash(text: string): string {
@@ -290,6 +324,91 @@ function runTaskFor(host: Host, web: Web) {
         return { text, usage: reply.usage, modelKey: `${ref.provider}/${ref.modelId}` };
     }
 
+    /** Classify text with Jev (typesafe.ai): Choice picks one category, Noul answers yes/no with a probability. */
+    async function jevClassify(
+        node: PipeNode,
+        stateText: string,
+        runInput: string,
+    ): Promise<{ text: string; detail: string; modelKey: string; usage: { input: number; output: number; cacheRead: number; cacheWrite: number; totalTokens: number; cost: { input: number; output: number; cacheRead: number; cacheWrite: number; total: number } } }> {
+        const fromSetting =
+            typeof web.setting === "function" ? cleanText(web.setting("jevKey"), 500) : "";
+        const key = fromSetting.trim() !== "" ? fromSetting.trim() : (process.env.TYPESAFE_API_KEY ?? "").trim();
+        if (key === "") {
+            throw new Error(
+                "Decision steps need a Jev API key: set it in Pipelines settings (Menu → Extensions → Pipelines), or TYPESAFE_API_KEY on the server.",
+            );
+        }
+        const kind = cleanText(node.config.kind, 20) || "choice";
+        const instructions = render(cleanText(node.config.instructions, 2000), {
+            input: runInput,
+            upstream: stateText,
+            outputs: new Map(),
+            nodes: [],
+        });
+        const model = cleanText(node.config.model, 60) || "jev-latest";
+        const question =
+            kind === "noul"
+                ? { type: "noul", instructions }
+                : {
+                      type: "choice",
+                      instructions,
+                      criteria: Object.fromEntries(
+                          parseCategories(cleanText(node.config.categories, 8000)).map((c) => [c.name, c.desc]),
+                      ),
+                  };
+        let res: Response;
+        try {
+            res = await fetch("https://api.typesafe.ai/v1/systemone", {
+                method: "POST",
+                headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
+                body: JSON.stringify({ model, state: stateText.slice(0, 20000), questions: { q: question } }),
+                signal: AbortSignal.timeout(60_000),
+            });
+        } catch (error) {
+            throw new Error(`Jev request failed: ${error instanceof Error ? error.message : String(error)}`);
+        }
+        if (!res.ok) {
+            if (res.status === 401 || res.status === 403) {
+                throw new Error("Jev refused the API key (401/403). Check the key in Pipelines settings.");
+            }
+            throw new Error(`Jev error ${res.status}: ${(await res.text()).slice(0, 500)}`);
+        }
+        const data = (await res.json()) as {
+            answers?: { q?: { type?: string; choice?: string; confidence?: number; probabilities?: Record<string, number>; noul?: number } };
+            usage?: { input_tokens?: number; output_tokens?: number };
+        };
+        const answer = data.answers?.q;
+        if (answer === undefined) throw new Error("Jev answered without a decision.");
+        const usage = {
+            input: data.usage?.input_tokens ?? 0,
+            output: data.usage?.output_tokens ?? 0,
+            cacheRead: 0,
+            cacheWrite: 0,
+            totalTokens: (data.usage?.input_tokens ?? 0) + (data.usage?.output_tokens ?? 0),
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+        };
+        const modelKey = `typesafe/${model}`;
+        const minConf = cleanNumber(node.config.minConfidence, 0, 0, 100) / 100;
+        if (kind === "noul") {
+            const p = typeof answer.noul === "number" ? answer.noul : NaN;
+            if (!Number.isFinite(p)) throw new Error("Jev answered without a yes/no probability.");
+            const threshold = cleanNumber(node.config.threshold, 50, 0, 100) / 100;
+            const conf = p >= threshold ? p : 1 - p;
+            const text = conf < minConf ? "unsure" : p >= threshold ? "true" : "false";
+            return { text, detail: `P(yes) ${(p * 100).toFixed(0)}% → ${text}`, modelKey, usage };
+        }
+        const winner = typeof answer.choice === "string" ? answer.choice : "";
+        const conf = typeof answer.confidence === "number" ? answer.confidence : NaN;
+        if (winner === "" || !Number.isFinite(conf)) throw new Error("Jev answered without a category.");
+        if (conf < minConf) return { text: "unsure", detail: `best ${winner} (${(conf * 100).toFixed(0)}%) below bar`, modelKey, usage };
+        const probs = Object.entries(answer.probabilities ?? {}).sort((a, b) => b[1] - a[1]);
+        const runnerUp = probs.find(([name]) => name !== winner);
+        const detail =
+            `${winner} (${(conf * 100).toFixed(0)}%)` +
+            (runnerUp ? `, next ${runnerUp[0]} (${((runnerUp[1] ?? 0) * 100).toFixed(0)}%)` : "");
+        return { text: winner, detail, modelKey, usage };
+    }
+
     const RunTaskDef = defineTask<RunInput, RunState, null>({
         name: "x.pipelines.run",
         version: 1,
@@ -416,6 +535,7 @@ function runTaskFor(host: Host, web: Web) {
                 // Execute one ready batch in parallel (fan-out). Each result is memoized first, so a restart
                 // that reruns this phase finds finished nodes instead of calling their models again.
                 const usages: { key: string; usage: never }[] = [];
+                const notes: { nodeId: string; text: string }[] = [];
                 const results = await Promise.allSettled(
                     ready.map(async (node) => {
                         const { active } = upstreamOf(node, graph, run.outputs, skipped);
@@ -444,6 +564,13 @@ function runTaskFor(host: Host, web: Web) {
                                       ? subject.trim() !== "" && subject.trim().toLowerCase() !== "false"
                                       : subject.includes(value);
                             out = hit ? "true" : "false";
+                        } else if (node.type === "decision") {
+                            const stateText = render(cleanText(node.config.template) || "{{upstream}}", ctx);
+                            if (stateText.trim() === "") throw new Error("Decision step has nothing to judge.");
+                            const decided = await jevClassify(node, stateText, run.input);
+                            usages.push({ key: decided.modelKey, usage: decided.usage as never });
+                            notes.push({ nodeId: node.id, text: `${labelOf(node)}: ${decided.detail}` });
+                            out = decided.text;
                         } else if (node.type === "bash") {
                             const env = await runtime.env(context);
                             if (env === undefined) throw new Error("This session has no shell environment.");
@@ -706,9 +833,10 @@ function runTaskFor(host: Host, web: Web) {
                         const result = results[i]!;
                         if (result.status === "fulfilled") {
                             item.outputs[node.id] = result.value.slice(0, 50_000);
+                            const extra = notes.find((n) => n.nodeId === node.id);
                             item.log = [
                                 ...item.log,
-                                { at: Date.now(), node: node.id, text: `${labelOf(node)} done (${result.value.length} chars)` },
+                                { at: Date.now(), node: node.id, text: extra ? extra.text : `${labelOf(node)} done (${result.value.length} chars)` },
                             ].slice(-100);
                         } else if (softFails.has(node.id)) {
                             item.outputs[node.id] = "";
@@ -778,6 +906,18 @@ function runTaskFor(host: Host, web: Web) {
 
 export default function createPipelines(host: Host, web: Web) {
     const RunTask = runTaskFor(host, web);
+
+    if (typeof web.settings === "function") {
+        web.settings([
+            {
+                name: "jevKey",
+                label: "Jev API key",
+                type: "text",
+                secret: true,
+                description: "typesafe.ai key for Decision steps (Choice/Noul classifiers). Server-only: never sent to the browser.",
+            },
+        ]);
+    }
 
     const startRun = async (
         commit: <T>(change: (tx: never) => T | Promise<T>) => Promise<T>,
@@ -950,7 +1090,7 @@ export default function createPipelines(host: Host, web: Web) {
     const pipePut = defineTool({
         name: "pipe_put",
         description:
-            'Create or replace a pipeline from graph JSON: {"nodes":[{"id":"in","type":"input","x":80,"y":80,"config":{"label":"Input"}},{"id":"llm1","type":"llm","x":320,"y":80,"config":{"label":"Answer","prompt":"{{upstream}}"}}],"edges":[{"id":"e1","from":"in","to":"llm1"}]}. Types: input, llm (config prompt/system/model), agent (config prompt/system-as-instructions/model/thinking; a real Pi sub-session with tools, its own transcript), prompt (config text), bash (config command/timeout; runs shell commands on the server), code (config code/timeout; JavaScript in a sandbox with input/upstream/outputs globals, no tools), branch (config template/mode/value; edges from it may set "when":"true"/"false"), loop (config prompt/times/until/model), approval (config title/text/askInput/onDecline; pauses and asks a person in the run session), subpipe (config pipeline = pipeline id or name, text = its input), output (config text). Templates use {{input}}, {{upstream}}, {{Node label}}, {{node-id}}.',
+            'Create or replace a pipeline from graph JSON: {"nodes":[{"id":"in","type":"input","x":80,"y":80,"config":{"label":"Input"}},{"id":"llm1","type":"llm","x":320,"y":80,"config":{"label":"Answer","prompt":"{{upstream}}"}}],"edges":[{"id":"e1","from":"in","to":"llm1"}]}. Types: input, llm (config prompt/system/model), agent (config prompt/system-as-instructions/model/thinking; a real Pi sub-session with tools, its own transcript), prompt (config text), bash (config command/timeout; runs shell commands on the server), code (config code/timeout; JavaScript in a sandbox with input/upstream/outputs globals, no tools), branch (config template/mode/value; edges from it may set "when":"true"/"false"), decision (config kind=choice|noul, instructions, categories as "name: when it applies" lines, model default jev-latest, minConfidence 0-100, threshold 0-100 for noul; needs a Jev API key in Pipelines settings; outputs the winning category, true/false, or unsure; route with edge when set to the category name, true/false, or unsure), loop (config prompt/times/until/model), approval (config title/text/askInput/onDecline; pauses and asks a person in the run session), subpipe (config pipeline = pipeline id or name, text = its input), output (config text). Templates use {{input}}, {{upstream}}, {{Node label}}, {{node-id}}.',
         parameters: Type.Object({
             name: Type.String({ description: "The pipeline's name. Same name replaces it." }),
             graphJson: Type.String({ description: "The graph as JSON, as in the description." }),

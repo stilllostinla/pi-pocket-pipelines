@@ -1,0 +1,67 @@
+{
+  "name": "Checklist",
+  "description": "Goal in, verified checklist out: draft -> refine loop -> validate -> human approval.",
+  "graph": {
+    "nodes": [
+      { "id": "in", "type": "input", "x": 40, "y": 260, "config": { "label": "Input" } },
+      {
+        "id": "draft",
+        "type": "llm",
+        "x": 250,
+        "y": 260,
+        "config": {
+          "label": "Draft checklist",
+          "system": "You write short, actionable checklists.",
+          "prompt": "Turn this goal into a markdown checklist.\nRules:\n- 5-10 steps\n- Each step on its own line as \"- [ ] ...\"\n- Each step concrete and verifiable, in order\n- Add done-criteria in parentheses\n\nGoal:\n{{input}}"
+        }
+      },
+      {
+        "id": "refine",
+        "type": "loop",
+        "x": 480,
+        "y": 260,
+        "config": {
+          "label": "Refine",
+          "prompt": "Improve this checklist. Make each step smaller, ordered, verifiable. Keep markdown checkboxes, 5-10 steps.\n\n{{prev}}",
+          "times": 2
+        }
+      },
+      {
+        "id": "validate",
+        "type": "code",
+        "x": 700,
+        "y": 260,
+        "config": {
+          "label": "Validate",
+          "code": "const lines = upstream.split('\\n');\nconst items = lines.filter(l => l.trim().startsWith('- [ ]'));\nif (items.length === 0) throw new Error(\"No checklist items found.\");\nreturn upstream.trim() + `\\n\\n<!-- items: ${items.length} -->`;"
+        }
+      },
+      {
+        "id": "approve",
+        "type": "approval",
+        "x": 920,
+        "y": 260,
+        "config": {
+          "label": "Approve checklist",
+          "title": "Approve this checklist?",
+          "text": "{{upstream}}",
+          "onDecline": "stop"
+        }
+      },
+      {
+        "id": "out",
+        "type": "output",
+        "x": 1140,
+        "y": 260,
+        "config": { "label": "Output", "text": "# Checklist\n\nGoal: {{input}}\n\n{{Approve checklist}}" }
+      }
+    ],
+    "edges": [
+      { "id": "e1", "from": "in", "to": "draft" },
+      { "id": "e2", "from": "draft", "to": "refine" },
+      { "id": "e3", "from": "refine", "to": "validate" },
+      { "id": "e4", "from": "validate", "to": "approve" },
+      { "id": "e5", "from": "approve", "to": "out" }
+    ]
+  }
+}

@@ -60,6 +60,10 @@ const typeText = async (el, value, proto) => {
 };
 const click = async (el) => act(async () => { el.dispatchEvent(new dom.window.MouseEvent("click", { bubbles: true })); await new Promise(r => setTimeout(r, 20)); });
 const field = (label) => [...$$(".pipe-props")[0].querySelectorAll(".pipe-field")].find(f => f.textContent.startsWith(label));
+const selectOption = async (el, value) => {
+  if (!el) return;
+  await act(async () => { el.value = value; el.dispatchEvent(new dom.window.Event("change", { bubbles: true })); await new Promise(r => setTimeout(r, 20)); });
+};
 
 // A: starter graph — rename + prompt
 let firstNode = $$(".pnode").find(n => n.textContent.includes("Answer"));
@@ -107,6 +111,52 @@ const tSaved = savedBody?.graph;
 check("template graph: 9 edges", (tSaved?.edges ?? []).length === 9);
 check("template scouts continue on error", (tSaved?.nodes ?? []).filter(n => n.type === "agent").every(n => n.config.onError === "continue"));
 check("template join references scout labels", (tSaved?.nodes ?? []).some(n => (n.config.text || "").includes("{{Scout — critic}}")));
+
+// F: decision step — configure choice classifier, connect it, route by category
+await click($$("button").find(b => b.textContent === "New"));
+await flush(30);
+await click($$(".pipe-add").find(b => b.textContent.includes("Decision")));
+await flush(30);
+check("decision props open with Judge kind", !!field("Judge"));
+await selectOption(field("Judge")?.querySelector("select"), "choice");
+await typeText(field("Question for Jev")?.querySelector("textarea"), "Which team?", dom.window.HTMLTextAreaElement);
+await typeText(field("Categories")?.querySelector("textarea"), "billing: money\ntechnical: broken", dom.window.HTMLTextAreaElement);
+check("decision sub-line counts choices", $$(".pnode").some(n => n.textContent.includes("2 choices")));
+await selectOption(field("Judge")?.querySelector("select"), "noul");
+check("noul shows threshold", !!field("Yes when"));
+check("noul sub-line says yes/no", $$(".pnode").some(n => n.textContent.includes("yes/no")));
+await selectOption(field("Judge")?.querySelector("select"), "choice");
+await typeText(field("Question for Jev")?.querySelector("textarea"), "Which team?", dom.window.HTMLTextAreaElement);
+await typeText(field("Categories")?.querySelector("textarea"), "billing: money\ntechnical: broken", dom.window.HTMLTextAreaElement);
+await click($$(".pipe-add").find(b => b.textContent.includes("Output")));
+await flush(30);
+const dNode = $$(".pnode").find(n => n.textContent.includes("Decision"));
+const oNode = $$(".pnode").pop();
+await act(async () => {
+  dNode.querySelector(".pport.out").dispatchEvent(new dom.window.MouseEvent("pointerdown", { bubbles: true }));
+  await new Promise(r => setTimeout(r, 20));
+});
+await act(async () => {
+  oNode.querySelector(".pport.in").dispatchEvent(new dom.window.MouseEvent("pointerdown", { bubbles: true }));
+  await new Promise(r => setTimeout(r, 30));
+});
+check("connecting decision to output adds an edge", $$(".pedge").length === 3);
+await click($$(".pedge").pop());
+await flush(30);
+const edgeSelect = $$(".pipe-props").length > 1 ? null : null;
+await selectOption($$(".pipe-props").at(-1)?.querySelector(".pipe-field select"), "__custom");
+await flush(20);
+const edgePanel = $$(".pipe-props").find(x => x.textContent.includes("Connection"));
+const whenInput = edgePanel
+  ? [...edgePanel.querySelectorAll(".pipe-field")].find(f => f.textContent.startsWith("Or a category name"))?.querySelector("input")
+  : null;
+check("edge offers a category-name when", !!whenInput);
+await typeText(whenInput, "billing", dom.window.HTMLInputElement);
+await click($$("button").find(b => b.textContent === "Save"));
+await flush(30);
+const dSaved = savedBody?.graph;
+check("save payload: decision config", (dSaved?.nodes ?? []).some(n => n.type === "decision" && n.config.kind === "choice" && (n.config.categories || "").includes("billing: money") && (n.config.instructions || "").includes("Which team?")));
+check("save payload: edge when=billing", (dSaved?.edges ?? []).some(e => e.when === "billing"));
 
 console.log(fails.length ? `UI-FAIL (${fails.length})` : "UI-OK");
 process.exit(fails.length ? 1 : 0);

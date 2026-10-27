@@ -207,6 +207,90 @@ askAnswer = { answered: false, by: "Tester" };
 const declined = await runPipe("MainPipe", "again");
 check("declined approval fails run", declined.includes("· failed") && declined.includes("declined"));
 
+// 7. Decision (Jev Choice): stub the HTTP endpoint, no network.
+delete process.env.TYPESAFE_API_KEY;
+await put("NoKeyPipe", {
+    nodes: [
+        { id: "in", type: "input", x: 0, y: 0, config: { label: "Input" } },
+        { id: "d", type: "decision", x: 0, y: 0, config: { label: "Route", kind: "choice", template: "{{upstream}}", instructions: "Which team?", categories: "billing: money\ntechnical: broken" } },
+        { id: "out", type: "output", x: 0, y: 0, config: { label: "Output", text: "{{upstream}}" } },
+    ],
+    edges: [{ id: "m1", from: "in", to: "d" }, { id: "m2", from: "d", to: "out" }],
+});
+const noKey = await runPipe("NoKeyPipe", "charge twice");
+check("decision without a key fails with guidance", noKey.includes("· failed") && noKey.includes("Jev API key"));
+
+let jevCalls: unknown[] = [];
+const jevQueue: unknown[] = [];
+(globalThis as { fetch?: unknown }).fetch = async (url: unknown, init: { body?: string }) => {
+    if (String(url) !== "https://api.typesafe.ai/v1/systemone") throw new Error(`unexpected fetch ${String(url)}`);
+    jevCalls.push(JSON.parse(init.body ?? "{}"));
+    const next = jevQueue.shift();
+    return { ok: true, status: 200, json: async () => next, text: async () => JSON.stringify(next) };
+};
+process.env.TYPESAFE_API_KEY = "test-key";
+const choiceAnswer = {
+    model: "jev-latest",
+    answers: { q: { type: "choice", choice: "billing", confidence: 0.8, probabilities: { billing: 0.8, technical: 0.2 } } },
+    usage: { input_tokens: 50, output_tokens: 5 },
+};
+await put("ChoicePipe", {
+    nodes: [
+        { id: "in", type: "input", x: 0, y: 0, config: { label: "Input" } },
+        { id: "d", type: "decision", x: 0, y: 0, config: { label: "Route", kind: "choice", template: "{{upstream}}", instructions: "Which team?", categories: "billing: money\ntechnical: broken", model: "jev-latest" } },
+        { id: "bill", type: "output", x: 0, y: 0, config: { label: "Bill", text: "B:{{upstream}}" } },
+        { id: "tech", type: "output", x: 0, y: 0, config: { label: "Tech", text: "T:{{upstream}}" } },
+    ],
+    edges: [
+        { id: "m1", from: "in", to: "d" },
+        { id: "m2", from: "d", to: "bill", when: "billing" },
+        { id: "m3", from: "d", to: "tech", when: "technical" },
+    ],
+});
+jevQueue.push(choiceAnswer);
+const choice = await runPipe("ChoicePipe", "charge twice");
+check("decision choice routes by winner", choice.includes("· done") && choice.includes("B:billing"));
+check("losing category path skipped", choice.includes("Skipped: tech"));
+check("jev got state+questions", (jevCalls[0] as { questions?: { q?: { type?: string; criteria?: object } } }).questions?.q?.type === "choice");
+check("choice logged with confidence", choice.includes("billing (80%)"));
+
+jevQueue.push(choiceAnswer);
+await put("UnsurePipe", {
+    nodes: [
+        { id: "in", type: "input", x: 0, y: 0, config: { label: "Input" } },
+        { id: "d", type: "decision", x: 0, y: 0, config: { label: "Route", kind: "choice", template: "{{upstream}}", instructions: "Which team?", categories: "billing: money\ntechnical: broken", minConfidence: 90 } },
+        { id: "u", type: "output", x: 0, y: 0, config: { label: "Human", text: "H:{{upstream}}" } },
+    ],
+    edges: [{ id: "m1", from: "in", to: "d" }, { id: "m2", from: "d", to: "u", when: "unsure" }],
+});
+const unsure = await runPipe("UnsurePipe", "charge twice");
+check("low confidence routes to unsure", unsure.includes("· done") && unsure.includes("H:unsure"));
+
+jevQueue.push({ model: "jev-latest", answers: { q: { type: "noul", noul: 0.7 } }, usage: { input_tokens: 10, output_tokens: 1 } });
+jevQueue.push({ model: "jev-latest", answers: { q: { type: "noul", noul: 0.2 } }, usage: { input_tokens: 10, output_tokens: 1 } });
+await put("NoulPipe", {
+    nodes: [
+        { id: "in", type: "input", x: 0, y: 0, config: { label: "Input" } },
+        { id: "y", type: "decision", x: 0, y: 0, config: { label: "Spam?", kind: "noul", template: "{{upstream}}", instructions: "Is this spam?", threshold: 50 } },
+        { id: "n", type: "decision", x: 0, y: 0, config: { label: "Spam2?", kind: "noul", template: "{{upstream}}", instructions: "Is this spam?", threshold: 50 } },
+        { id: "out", type: "output", x: 0, y: 0, config: { label: "Output", text: "{{Spam?}}/{{Spam2?}}" } },
+    ],
+    edges: [{ id: "m1", from: "in", to: "y" }, { id: "m2", from: "in", to: "n" }, { id: "m3", from: "y", to: "out" }, { id: "m4", from: "n", to: "out" }],
+});
+const noul = await runPipe("NoulPipe", "hello");
+check("noul true/false by threshold", noul.includes("· done") && noul.includes("true/false"));
+
+let threw = "";
+try {
+    await tool("pipe_put").execute({ name: "BadDecision", graphJson: JSON.stringify({
+        nodes: [{ id: "d", type: "decision", x: 0, y: 0, config: { label: "Route", kind: "choice", instructions: "Pick.", categories: "" } }],
+        edges: [],
+    }) } as never, api(900, "bad") as never, context as never);
+} catch (e) {
+    threw = e instanceof Error ? e.message : String(e);
+}
+check("choice with no categories is refused", threw.includes("at least one category"));
+
 console.log(fails.length ? `E2E-FAIL (${fails.length})` : "E2E-OK");
 await harness.close(context);
 process.exit(fails.length ? 1 : 0);

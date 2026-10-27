@@ -13,6 +13,7 @@ const TYPES = [
     { type: "bash", label: "Shell", color: "#ffa657" },
     { type: "code", label: "Code", color: "#a5d6ff" },
     { type: "branch", label: "Branch", color: "#f2cc60" },
+    { type: "decision", label: "Decision", color: "#f778ba" },
     { type: "loop", label: "Loop", color: "#ff7b72" },
     { type: "approval", label: "Approval", color: "#ffcda3" },
     { type: "subpipe", label: "Sub-pipeline", color: "#56d4dd" },
@@ -35,6 +36,7 @@ function defaultNode(type, x, y) {
     if (type === "output") base.config = { label: "Output", text: "{{upstream}}" };
     if (type === "bash") base.config = { label: "Shell", command: "echo {{upstream}}", timeout: 120 };
     if (type === "branch") base.config = { label: "Branch", template: "{{upstream}}", mode: "contains", value: "yes" };
+    if (type === "decision") base.config = { label: "Decision", kind: "choice", template: "{{upstream}}", instructions: "", categories: "billing: payment or subscription issues\ntechnical: the product is broken or unusable\nsales: wants pricing or a demo", model: "jev-latest", threshold: 50, minConfidence: 0 };
     if (type === "loop") base.config = { label: "Loop", system: "", prompt: "Improve this:\n{{prev}}", times: 3, until: "", model: "" };
     return base;
 }
@@ -74,6 +76,30 @@ function researchGraph() {
         ...scouts.map((s) => ({ id: nid("e"), from: s.id, to: join.id })),
         { id: nid("e"), from: join.id, to: synth.id },
         { id: nid("e"), from: synth.id, to: out.id },
+    ];
+    return { nodes, edges };
+}
+
+/** Goal in, verified checklist out: draft, refine loop, format check, human approval. */
+function checklistGraph() {
+    const input = defaultNode("input", 40, 260);
+    const draft = defaultNode("llm", 250, 260);
+    draft.config = { label: "Draft checklist", system: "You write short, actionable checklists.", prompt: "Turn this goal into a markdown checklist.\nRules:\n- 5-10 steps\n- Each step on its own line as \"- [ ] ...\"\n- Each step concrete and verifiable, in order\n- Add done-criteria in parentheses\n\nGoal:\n{{input}}", model: "" };
+    const refine = defaultNode("loop", 480, 260);
+    refine.config = { label: "Refine", system: "", prompt: "Improve this checklist. Make each step smaller, ordered, verifiable. Keep markdown checkboxes, 5-10 steps.\n\n{{prev}}", times: 2, until: "", model: "" };
+    const validate = defaultNode("code", 700, 260);
+    validate.config = { label: "Validate", code: "const lines = upstream.split('\\n');\nconst items = lines.filter(l => l.trim().startsWith('- [ ]'));\nif (items.length === 0) throw new Error(\"No checklist items found. Draft step must output '- [ ]' lines.\");\nreturn upstream.trim() + `\\n\\n<!-- items: ${items.length} -->`;", timeout: 10 };
+    const approve = defaultNode("approval", 920, 260);
+    approve.config = { label: "Approve checklist", title: "Approve this checklist?", text: "{{upstream}}", askInput: false, onDecline: "stop" };
+    const out = defaultNode("output", 1140, 260);
+    out.config = { label: "Output", text: "# Checklist\n\nGoal: {{input}}\n\n{{Approve checklist}}" };
+    const nodes = [input, draft, refine, validate, approve, out];
+    const edges = [
+        { id: nid("e"), from: input.id, to: draft.id },
+        { id: nid("e"), from: draft.id, to: refine.id },
+        { id: nid("e"), from: refine.id, to: validate.id },
+        { id: nid("e"), from: validate.id, to: approve.id },
+        { id: nid("e"), from: approve.id, to: out.id },
     ];
     return { nodes, edges };
 }
@@ -215,6 +241,7 @@ export default function setup(pocket) {
         const loadDef = (d) => { setDefId(d.id); setName(d.name); setGraph(JSON.parse(JSON.stringify(d.graph))); setSelNode(null); setSelEdge(null); setMsg(""); };
         const newPipe = () => { setDefId(""); setName("Untitled pipeline"); setGraph(starterGraph()); setSelNode(null); setSelEdge(null); };
         const applyResearch = () => { setDefId(""); setName("Research scouts"); setGraph(researchGraph()); setSelNode(null); setSelEdge(null); setMsg("Template loaded: 3 scout agents run in parallel. Save, then Run."); };
+        const applyChecklist = () => { setDefId(""); setName("Checklist"); setGraph(checklistGraph()); setSelNode(null); setSelEdge(null); setMsg("Template loaded: goal in, verified checklist out with human approval. Save, then Run."); };
         const removeDef = async () => {
             if (!defId) return;
             setBusy(true);
@@ -253,6 +280,7 @@ export default function setup(pocket) {
                 <input class="pipe-in grow" value=${name} onInput=${(e) => setName(e.target.value)} placeholder="Pipeline name" />
                 <button class="button" onClick=${newPipe}>New</button>
                 <button class="button" onClick=${applyResearch}>Template: Research scouts</button>
+                <button class="button" onClick=${applyChecklist}>Template: Checklist</button>
                 <button class="button primary" disabled=${busy} onClick=${save}>Save</button>
                 ${defId ? html`<button class="button" disabled=${busy} onClick=${removeDef}>Delete</button>` : null}
             </div>
@@ -278,7 +306,7 @@ export default function setup(pocket) {
                         return html`<div class=${"pnode" + (n.id === selNode ? " sel" : "")} style=${`left:${n.x}px;top:${n.y}px;border-color:${colorOf(n.type)}`} onPointerDown=${(e) => startDrag(e, n)} onClick=${() => { setSelNode(n.id); setSelEdge(null); }}>
                             <div class="pnode-head"><span class="pdot" style=${`background:${colorOf(n.type)}`}></span><b>${labelOf(n)}</b><span class="muted small">${n.type}</span>
                             ${running ? html`<span class="small" style="color:var(--warn)">running…</span>` : runOut !== undefined && runOut !== false ? html`<span class="small" style="color:var(--ok)">✓</span>` : null}</div>
-                            <div class="pnode-sub muted small">${n.type === "llm" || n.type === "agent" ? n.config.model || "session model" : n.type === "loop" ? `×${n.config.times || 3}` : n.type === "bash" ? String(n.config.command || "").slice(0, 34) : n.type === "subpipe" ? String(n.config.pipeline || "").slice(0, 34) : n.type === "branch" ? `${n.config.mode || "contains"} “${n.config.value || ""}”` : ""}</div>
+                            <div class="pnode-sub muted small">${n.type === "llm" || n.type === "agent" ? n.config.model || "session model" : n.type === "loop" ? `×${n.config.times || 3}` : n.type === "bash" ? String(n.config.command || "").slice(0, 34) : n.type === "subpipe" ? String(n.config.pipeline || "").slice(0, 34) : n.type === "branch" ? `${n.config.mode || "contains"} “${n.config.value || ""}”` : n.type === "decision" ? `${n.config.kind === "noul" ? "yes/no" : `${String(n.config.categories || "").split("\n").filter((l) => l.trim() !== "").length} choices`}` : ""}</div>
                             <span class="pport in" title="Input — tap after choosing an output" onPointerDown=${(e) => onPortIn(e, n.id)}></span>
                             <span class="pport out" title="Output — tap, then tap a target input" onPointerDown=${(e) => onPortOut(e, n.id)}></span>
                         </div>`;
@@ -318,6 +346,19 @@ export default function setup(pocket) {
                         <option value="contains">contains</option><option value="equals">equals</option><option value="truthy">is non-empty</option></select></label>
                     <label class="pipe-field">Value<input class="pipe-in" value=${node.config.value || ""} onInput=${(e) => patchConfig(node.id, "value", e.target.value)} /></label>
                     <p class="muted small">Then tap each edge leaving this node and set it to “when true” or “when false”.</p>` : null}
+                ${node.type === "decision" ? html`
+                    <label class="pipe-field">Judge<select class="pipe-in" value=${node.config.kind || "choice"} onChange=${(e) => patchConfig(node.id, "kind", e.target.value)}>
+                        <option value="choice">Choice — pick one category (Jev classifier)</option><option value="noul">Yes / No — answer a yes-no question (Jev probability)</option></select></label>
+                    <label class="pipe-field">Text to judge<textarea class="pipe-in" rows="3" value=${node.config.template || ""} onInput=${(e) => patchConfig(node.id, "template", e.target.value)}></textarea></label>
+                    <label class="pipe-field">Question for Jev<textarea class="pipe-in" rows="2" value=${node.config.instructions || ""} onInput=${(e) => patchConfig(node.id, "instructions", e.target.value)} placeholder="Which team should handle this?"></textarea></label>
+                    ${node.config.kind === "noul" ? html`
+                        <label class="pipe-field">Yes when P(yes) ≥ (%)<input class="pipe-in" type="number" min="0" max="100" value=${node.config.threshold ?? 50} onInput=${(e) => patchConfig(node.id, "threshold", e.target.value === "" ? "" : Number(e.target.value))} /></label>
+                        <p class="muted small">Outputs “true” or “false”. Route edges with “when true” / “when false”.</p>` : html`
+                        <label class="pipe-field">Categories — one “name: when it applies” per line<textarea class="pipe-in mono" rows="5" value=${node.config.categories || ""} onInput=${(e) => patchConfig(node.id, "categories", e.target.value)}></textarea></label>
+                        <p class="muted small">Outputs the winning category name. Tap each edge leaving this step and set “when” to a category name.</p>`}
+                    <label class="pipe-field">Jev model<input class="pipe-in" value=${node.config.model || "jev-latest"} onInput=${(e) => patchConfig(node.id, "model", e.target.value)} placeholder="jev-latest" /></label>
+                    <label class="pipe-field">Unsure below confidence (%)<input class="pipe-in" type="number" min="0" max="100" value=${node.config.minConfidence ?? 0} onInput=${(e) => patchConfig(node.id, "minConfidence", e.target.value === "" ? "" : Number(e.target.value))} /></label>
+                    <p class="muted small">0 = always take the winner. Above 0, low-confidence answers output “unsure” — route them with “when unsure”. Needs a Jev API key in Pipelines settings.</p>` : null}
                 ${node.type === "code" ? html`
                     <label class="pipe-field">JavaScript — globals: input, upstream, outputs (by node id). Return a value, or console.log it. No tools, files, or network.<textarea class="pipe-in mono" rows="8" value=${node.config.code || ""} onInput=${(e) => patchConfig(node.id, "code", e.target.value)}></textarea></label>
                     <label class="pipe-field">Timeout (seconds, max 60)<input class="pipe-in" type="number" min="1" max="60" value=${node.config.timeout ?? 10} onInput=${(e) => patchConfig(node.id, "timeout", e.target.value === "" ? "" : Number(e.target.value))} /></label>` : null}
@@ -335,15 +376,16 @@ export default function setup(pocket) {
                     <label class="pipe-field">Its input<textarea class="pipe-in" rows="3" value=${node.config.text || ""} onInput=${(e) => patchConfig(node.id, "text", e.target.value)}></textarea></label>
                     <p class="muted small">Runs that pipeline as a child run (nesting at most 3 deep) and outputs its Output nodes.</p>` : null}
                 ${node.type === "input" ? html`<p class="muted small">Outputs the text you type in Run input below.</p>` : null}
-                ${["llm", "agent", "bash", "code", "loop", "subpipe"].includes(node.type) ? html`<label class="pipe-field">On error<select class="pipe-in" value=${node.config.onError || "fail"} onChange=${(e) => patchConfig(node.id, "onError", e.target.value)}><option value="fail">Stop the run</option><option value="continue">Continue without this step (output empty, noted in the run)</option></select></label>` : null}
+                ${["llm", "agent", "bash", "code", "decision", "loop", "subpipe"].includes(node.type) ? html`<label class="pipe-field">On error<select class="pipe-in" value=${node.config.onError || "fail"} onChange=${(e) => patchConfig(node.id, "onError", e.target.value)}><option value="fail">Stop the run</option><option value="continue">Continue without this step (output empty, noted in the run)</option></select></label>` : null}
                 <p class="muted small">Templates: {{input}} · {{upstream}} · {{Node label}} · {{node-id}}${node.type === "loop" ? " · {{prev}} · {{index}}" : ""}</p>
             </div>` : null}
 
             ${edge ? html`<div class="pipe-props" ref=${propsRef}>
                 <div class="setting"><div class="grow"><b>Connection</b> <span class="muted small">${edge.from} → ${edge.to}</span></div>
                 <button class="button" onClick=${deleteSelected}>Delete edge</button></div>
-                <label class="pipe-field">When<select class="pipe-in" value=${edge.when || ""} onChange=${(e) => setGraph((g) => ({ ...g, edges: g.edges.map((x) => x.id === edge.id ? { ...x, ...(e.target.value ? { when: e.target.value } : { when: undefined }) } : x) }))}>
-                    <option value="">always</option><option value="true">when true (branch)</option><option value="false">when false (branch)</option></select></label>
+                <label class="pipe-field">When<select class="pipe-in" value=${edge.when === "true" || edge.when === "false" ? edge.when : (edge.when ? edge.when : "")} onChange=${(e) => setGraph((g) => ({ ...g, edges: g.edges.map((x) => x.id === edge.id ? { ...x, ...(e.target.value ? { when: e.target.value.slice(0, 80) } : { when: undefined }) } : x) }))}>
+                    <option value="">always</option><option value="true">when true (branch / yes-no)</option><option value="false">when false (branch / yes-no)</option>${(edge.when && edge.when !== "true" && edge.when !== "false") ? html`<option value=${edge.when}>when: ${edge.when}</option>` : null}</select></label>
+                <label class="pipe-field">Or a category name (Decision outputs it; “unsure” for low confidence)<input class="pipe-in" value=${(edge.when === "true" || edge.when === "false") ? "" : (edge.when || "")} onInput=${(e) => setGraph((g) => ({ ...g, edges: g.edges.map((x) => x.id === edge.id ? { ...x, ...(e.target.value.trim() ? { when: e.target.value.trim().slice(0, 80) } : { when: undefined }) } : x) }))} placeholder="billing — or unsure" /></label>
             </div>` : null}
 
             <div class="pipe-props">

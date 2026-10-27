@@ -4,7 +4,7 @@ A visual, durable LLM workflow editor for [Pi Pocket](https://github.com/TannerM
 
 Drag nodes onto a canvas, connect them, and run: chained LLM calls, parallel scout agents, loops, branches, shell commands, human approvals, and nested pipelines — with every run checkpointed so a server restart resumes it instead of losing it.
 
-![node types: Input, LLM call, Agent, Prompt, Shell, Code, Branch, Loop, Approval, Sub-pipeline, Output]
+![node types: Input, LLM call, Agent, Prompt, Shell, Code, Branch, Decision, Loop, Approval, Sub-pipeline, Output]
 
 ## Install
 
@@ -33,6 +33,7 @@ Then in Pi Pocket: **Menu → Extensions → Pipelines → turn on**, and refres
 | Shell | A shell command in the run session's folder (runs on the server!) |
 | Code | JavaScript in a sandbox: `input`, `upstream`, `outputs` globals; return a value. No tools/files/network |
 | Branch | `contains` / `equals` / non-empty test → `true`/`false` |
+| Decision | Jev classifier (typesafe.ai): Choice picks one category, Yes/No answers a yes-no question → winner name, `true`/`false`, or `unsure` |
 | Loop | Repeat an LLM call N rounds (or until output contains text), `{{prev}}`/`{{index}}` |
 | Approval | Pauses and asks a person in the run's session; decline can fail the run or output `declined` |
 | Sub-pipeline | Runs another saved pipeline (max 3 deep) |
@@ -42,6 +43,18 @@ Templates: `{{input}}`, `{{upstream}}` (direct predecessors), `{{Node label}}`, 
 Most executable steps can **continue on error**: the step outputs nothing, the failure is noted in the run, and downstream steps still run — made for parallel scouts.
 
 Pi can drive it too: `pipe_list`, `pipe_put` (graph JSON), `pipe_get`, `pipe_run`, `pipe_status`, `pipe_stop`.
+
+## Decision steps (Jev)
+
+A Decision step sends the text you point it at to [Jev](https://docs.typesafe.ai) (`POST /v1/systemone`), TypeSafe's classifier model, instead of a generative LLM:
+
+- **Choice** — you list categories as `name: when it applies` lines plus a question (“Which team should handle this?”). Jev returns the winning category with a confidence and per-category probabilities. The step outputs the winner's name, so edges with `when` set to a category route to the right path.
+- **Yes / No** — you ask a yes-no question; Jev returns P(yes). Above your threshold (default 50%) the step outputs `true`, else `false` — routed exactly like a Branch.
+- **Unsure** — set a minimum confidence. Below it the step outputs `unsure`, which you route with an edge whose `when` is `unsure` (e.g. to a human Approval step).
+
+You need a Jev API key: **Menu → Extensions → Pipelines** (the settings form there; stored server-side, never sent to the browser), or `TYPESAFE_API_KEY` on the server. Model defaults to `jev-latest`. Jev bills input tokens only (no output-token charge); usage is counted under `typesafe/<model>` in the run session's spend ledger, with $0 cost attached — check your TypeSafe console for actual spend.
+
+Rule of thumb: **Branch** for exact rules you can write down, **Decision** for judgment calls in prose (tone, topic, spam, priority) where a keyword test would be brittle.
 
 ## Durability
 

@@ -14,7 +14,12 @@ const TYPES = [
     { type: "code", label: "Code", color: "#a5d6ff" },
     { type: "branch", label: "Branch", color: "#f2cc60" },
     { type: "decision", label: "Decision", color: "#f778ba" },
-    { type: "loop", label: "Loop", color: "#ff7b72" },
+    { type: "refine", label: "Refine", color: "#ff7b72" },
+    { type: "map", label: "Map", color: "#4dd0e1" },
+    { type: "merge", label: "Merge", color: "#69f0ae" },
+    { type: "write", label: "Write file", color: "#bcaaa4" },
+    { type: "read", label: "Read file", color: "#bcaaa4" },
+    { type: "fetch", label: "Fetch URL", color: "#80cbc4" },
     { type: "approval", label: "Approval", color: "#ffcda3" },
     { type: "subpipe", label: "Sub-pipeline", color: "#56d4dd" },
     { type: "output", label: "Output", color: "#79c0ff" },
@@ -36,8 +41,13 @@ function defaultNode(type, x, y) {
     if (type === "output") base.config = { label: "Output", text: "{{upstream}}" };
     if (type === "bash") base.config = { label: "Shell", command: "echo {{upstream}}", timeout: 120 };
     if (type === "branch") base.config = { label: "Branch", template: "{{upstream}}", mode: "contains", value: "yes" };
-    if (type === "decision") base.config = { label: "Decision", provider: "jev", kind: "choice", template: "{{upstream}}", instructions: "", categories: "billing: payment or subscription issues\ntechnical: the product is broken or unusable\nsales: wants pricing or a demo", model: "", threshold: 50, minConfidence: 0 };
-    if (type === "loop") base.config = { label: "Loop", system: "", prompt: "Improve this:\n{{prev}}", times: 3, until: "", model: "" };
+    if (type === "decision") base.config = { label: "Decision", provider: "jev", kind: "choice", template: "{{upstream}}", instructions: "", categories: "billing: payment or subscription issues\ntechnical: the product is broken or unusable\nsales: wants pricing or a demo", model: "", threshold: 50, minConfidence: 0, cut: "" };
+    if (type === "refine") base.config = { label: "Refine", system: "", prompt: "Improve this:\n{{prev}}", times: 3, until: "", model: "" };
+    if (type === "map") base.config = { label: "Map", pipeline: "", list: "{{upstream}}", itemTemplate: "{{item}}", maxItems: 30, concurrency: 4 };
+    if (type === "merge") base.config = { label: "Merge", budget: 50000, keep: 10, strategy: "summarize-rest" };
+    if (type === "write") base.config = { label: "Write file", file: "briefs/output.md", text: "{{upstream}}" };
+    if (type === "read") base.config = { label: "Read file", file: "briefs/seed.md" };
+    if (type === "fetch") base.config = { label: "Fetch URL", template: "{{upstream}}", maxChars: 20000 };
     return base;
 }
 
@@ -125,6 +135,7 @@ export default function setup(pocket) {
         const [thinkingLevels, setThinkingLevels] = useState([]);
         const [apiKeys, setApiKeys] = useState({});
         const [input, setInput] = useState("");
+        const [paramsText, setParamsText] = useState("{}");
         const [msg, setMsg] = useState("");
         const [err, setErr] = useState("");
         const [busy, setBusy] = useState(false);
@@ -253,8 +264,10 @@ export default function setup(pocket) {
             if (!defId) { setErr("Save the pipeline first, then Run."); return; }
             if (!sessionId) { setErr("Pick a session to run in (its model, folder and spend apply)."); return; }
             setBusy(true);
+            let params;
+            try { params = paramsText.trim() === "" ? {} : JSON.parse(paramsText); } catch (e) { setErr("Params are not valid JSON."); setBusy(false); return; }
             try {
-                const r = await pocket.api(`runs/${sessionId}`, { pipelineId: defId, input });
+                const r = await pocket.api(`runs/${sessionId}`, { pipelineId: defId, input, params });
                 setRuns((prev) => [r, ...prev.filter((x) => x.id !== r.id)]);
                 setOpenRun(r.id); setMsg("Run started — it checkpoints after each batch and survives a restart.");
             } catch (e) { setErr(e.message); } finally { setBusy(false); }
@@ -307,7 +320,7 @@ export default function setup(pocket) {
                         return html`<div class=${"pnode" + (n.id === selNode ? " sel" : "")} style=${`left:${n.x}px;top:${n.y}px;border-color:${colorOf(n.type)}`} onPointerDown=${(e) => startDrag(e, n)} onClick=${() => { setSelNode(n.id); setSelEdge(null); }}>
                             <div class="pnode-head"><span class="pdot" style=${`background:${colorOf(n.type)}`}></span><b>${labelOf(n)}</b><span class="muted small">${n.type}</span>
                             ${running ? html`<span class="small" style="color:var(--warn)">running…</span>` : runOut !== undefined && runOut !== false ? html`<span class="small" style="color:var(--ok)">✓</span>` : null}</div>
-                            <div class="pnode-sub muted small">${n.type === "llm" || n.type === "agent" ? n.config.model || "session model" : n.type === "loop" ? `×${n.config.times || 3}` : n.type === "bash" ? String(n.config.command || "").slice(0, 34) : n.type === "subpipe" ? String(n.config.pipeline || "").slice(0, 34) : n.type === "branch" ? `${n.config.mode || "contains"} “${n.config.value || ""}”` : n.type === "decision" ? `${n.config.provider === "openai" ? "openai" : n.config.provider === "openrouter" ? "openrouter" : "jev"} · ${n.config.kind === "noul" ? "yes/no" : n.config.kind === "score" ? "score" : `${String(n.config.categories || "").split("\n").filter((l) => l.trim() !== "").length} choices`}` : ""}</div>
+                            <div class="pnode-sub muted small">${n.type === "llm" || n.type === "agent" ? n.config.model || "session model" : n.type === "bash" ? String(n.config.command || "").slice(0, 34) : n.type === "subpipe" ? String(n.config.pipeline || "").slice(0, 34) : n.type === "branch" ? `${n.config.mode || "contains"} “${n.config.value || ""}”` : n.type === "decision" ? `${n.config.provider || "jev"} · ${n.config.kind === "noul" ? "yes/no" : n.config.kind === "score" ? "score" : `${String(n.config.categories || "").split("\n").filter((l) => l.trim() !== "").length} choices`}` : n.type === "refine" ? `×${n.config.times || 3}` : n.type === "map" ? `${n.config.concurrency || 4}× ${String(n.config.pipeline || "").slice(0, 24)}` : n.type === "merge" ? `≤${n.config.budget || 50000}t` : n.type === "write" || n.type === "read" || n.type === "fetch" ? String(n.config.file || n.config.template || "").slice(0, 34) : ""}</div>
                             <span class="pport in" title="Input — tap after choosing an output" onPointerDown=${(e) => onPortIn(e, n.id)}></span>
                             <span class="pport out" title="Output — tap, then tap a target input" onPointerDown=${(e) => onPortOut(e, n.id)}></span>
                         </div>`;
@@ -320,7 +333,7 @@ export default function setup(pocket) {
                 <div class="setting"><div class="grow"><b>✎ Edit step — ${labelOf(node)}</b> <span class="muted small">${node.type} · ${node.id}</span></div>
                 <button class="button" onClick=${() => { patchNode(node.id, { x: node.x, y: node.y }); setGraph((g) => ({ nodes: g.nodes.filter((n) => n.id !== node.id), edges: g.edges.filter((e) => e.from !== node.id && e.to !== node.id) })); setSelNode(null); }}>Delete node</button></div>
                 <label class="pipe-field">Step name — this card's title; other steps read its output as {{name}}<input class="pipe-in" value=${node.config.label || ""} onInput=${(e) => patchConfig(node.id, "label", e.target.value)} placeholder=${node.type} /></label>
-                ${node.type === "llm" || node.type === "loop" || node.type === "agent" ? html`
+                ${node.type === "llm" || node.type === "refine" || node.type === "agent" ? html`
                     <label class="pipe-field">Model (blank = run session's model)
                         <select class="pipe-in" value=${node.config.model || ""} onChange=${(e) => patchConfig(node.id, "model", e.target.value)}>
                             <option value="">Session model</option>
@@ -333,10 +346,35 @@ export default function setup(pocket) {
                         ${thinkingLevels.map((l) => html`<option value=${l}>${l}</option>`)}</select></label>
                     <p class="muted small">Starts a real Pi sub-session with its own tools and transcript (no pipeline tools). Its answer becomes this node's output. Open it from the run below while it works.</p>` : null}
                 ${node.type === "llm" || node.type === "agent" ? html`<label class="pipe-field">Prompt<textarea class="pipe-in" rows="5" value=${node.config.prompt || ""} onInput=${(e) => patchConfig(node.id, "prompt", e.target.value)}></textarea></label>` : null}
-                ${node.type === "loop" ? html`
+                ${node.type === "refine" ? html`
                     <label class="pipe-field">Prompt ({{prev}} = last round)<textarea class="pipe-in" rows="5" value=${node.config.prompt || ""} onInput=${(e) => patchConfig(node.id, "prompt", e.target.value)}></textarea></label>
                     <label class="pipe-field">Rounds<input class="pipe-in" type="number" min="1" max="20" value=${node.config.times ?? 3} onInput=${(e) => patchConfig(node.id, "times", e.target.value === "" ? "" : Number(e.target.value))} /></label>
                     <label class="pipe-field">Stop early when output contains<input class="pipe-in" value=${node.config.until || ""} onInput=${(e) => patchConfig(node.id, "until", e.target.value)} /></label>` : null}
+                ${node.type === "map" ? html`
+                    <label class="pipe-field">Pipeline (runs once per item)<select class="pipe-in" value=${node.config.pipeline || ""} onChange=${(e) => patchConfig(node.id, "pipeline", e.target.value)}>
+                        <option value="">— choose —</option>
+                        ${(defs || []).map((d) => html`<option value=${d.id}>${d.name}</option>`)}</select></label>
+                    <label class="pipe-field">List — JSON array, one item per line, file:path, or folder:path (of .txt files)<textarea class="pipe-in mono" rows="4" value=${node.config.list || ""} onInput=${(e) => patchConfig(node.id, "list", e.target.value)}></textarea></label>
+                    <label class="pipe-field">Child input template<textarea class="pipe-in" rows="2" value=${node.config.itemTemplate || "{{item}}"} onInput=${(e) => patchConfig(node.id, "itemTemplate", e.target.value)}></textarea></label>
+                    <label class="pipe-field">Max items<input class="pipe-in" type="number" min="1" max="100" value=${node.config.maxItems ?? 30} onInput=${(e) => patchConfig(node.id, "maxItems", e.target.value === "" ? "" : Number(e.target.value))} /></label>
+                    <label class="pipe-field">At once (1 = sequential, saves quota)<input class="pipe-in" type="number" min="1" max="8" value=${node.config.concurrency ?? 4} onInput=${(e) => patchConfig(node.id, "concurrency", e.target.value === "" ? "" : Number(e.target.value))} /></label>
+                    <p class="muted small">Outputs a JSON array of {item, output}. Each child is its own durable run — {{item}} and {{index}} are available in its input.</p>` : null}
+                ${node.type === "merge" ? html`
+                    <label class="pipe-field">Budget (tokens)<input class="pipe-in" type="number" min="100" max="500000" step="1000" value=${node.config.budget ?? 50000} onInput=${(e) => patchConfig(node.id, "budget", e.target.value === "" ? "" : Number(e.target.value))} /></label>
+                    <label class="pipe-field">Keep whole (top N)<input class="pipe-in" type="number" min="1" max="100" value=${node.config.keep ?? 10} onInput=${(e) => patchConfig(node.id, "keep", e.target.value === "" ? "" : Number(e.target.value))} /></label>
+                    <label class="pipe-field">The rest<select class="pipe-in" value=${node.config.strategy || "summarize-rest"} onChange=${(e) => patchConfig(node.id, "strategy", e.target.value)}><option value="summarize-rest">Summarize into one brief</option><option value="drop-rest">Drop</option></select></label>
+                    <p class="muted small">Items with a numeric score rank first. The rest are summarized with the run's model.</p>` : null}
+                ${node.type === "write" ? html`
+                    <label class="pipe-field">Path (in the run folder)<input class="pipe-in mono" value=${node.config.file || ""} onInput=${(e) => patchConfig(node.id, "file", e.target.value)} placeholder="briefs/report.md" /></label>
+                    <label class="pipe-field">Text<textarea class="pipe-in" rows="5" value=${node.config.text || ""} onInput=${(e) => patchConfig(node.id, "text", e.target.value)}></textarea></label>
+                    <p class="muted small">Tracked in the run's files. Downstream steps read the path from {{Label}}.</p>` : null}
+                ${node.type === "read" ? html`
+                    <label class="pipe-field">Path (in the run folder)<input class="pipe-in mono" value=${node.config.file || ""} onInput=${(e) => patchConfig(node.id, "file", e.target.value)} placeholder="briefs/seed.md" /></label>
+                    <p class="muted small">Outputs the file's text (first 100k chars). A later run can seed from the same path.</p>` : null}
+                ${node.type === "fetch" ? html`
+                    <label class="pipe-field">URL<textarea class="pipe-in" rows="2" value=${node.config.template || ""} onInput=${(e) => patchConfig(node.id, "template", e.target.value)} placeholder="https://… or {{upstream}}"></textarea></label>
+                    <label class="pipe-field">Max chars<input class="pipe-in" type="number" min="100" max="100000" step="1000" value=${node.config.maxChars ?? 20000} onInput=${(e) => patchConfig(node.id, "maxChars", e.target.value === "" ? "" : Number(e.target.value))} /></label>
+                    <p class="muted small">No key needed. Thin pages (&lt;500 chars) are flagged — they may need JS rendering.</p>` : null}
                 ${node.type === "prompt" || node.type === "output" ? html`<label class="pipe-field">Text<textarea class="pipe-in" rows="5" value=${node.config.text || ""} onInput=${(e) => patchConfig(node.id, "text", e.target.value)}></textarea></label>` : null}
                 ${node.type === "bash" ? html`
                     <label class="pipe-field">Command (runs in the run session's folder)<textarea class="pipe-in" rows="4" value=${node.config.command || ""} onInput=${(e) => patchConfig(node.id, "command", e.target.value)}></textarea></label>
@@ -383,8 +421,9 @@ export default function setup(pocket) {
                     <label class="pipe-field">Its input<textarea class="pipe-in" rows="3" value=${node.config.text || ""} onInput=${(e) => patchConfig(node.id, "text", e.target.value)}></textarea></label>
                     <p class="muted small">Runs that pipeline as a child run (nesting at most 3 deep) and outputs its Output nodes.</p>` : null}
                 ${node.type === "input" ? html`<p class="muted small">Outputs the text you type in Run input below.</p>` : null}
-                ${["llm", "agent", "bash", "code", "decision", "loop", "subpipe"].includes(node.type) ? html`<label class="pipe-field">On error<select class="pipe-in" value=${node.config.onError || "fail"} onChange=${(e) => patchConfig(node.id, "onError", e.target.value)}><option value="fail">Stop the run</option><option value="continue">Continue without this step (output empty, noted in the run)</option></select></label>` : null}
-                <p class="muted small">Templates: {{input}} · {{upstream}} · {{Node label}} · {{node-id}}${node.type === "loop" ? " · {{prev}} · {{index}}" : ""}</p>
+                ${["llm", "agent", "bash", "code", "decision", "refine", "map", "merge", "fetch", "subpipe"].includes(node.type) ? html`<label class="pipe-field">On error<select class="pipe-in" value=${node.config.onError || "fail"} onChange=${(e) => patchConfig(node.id, "onError", e.target.value)}><option value="fail">Stop the run</option><option value="continue">Continue without this step (output empty, noted in the run)</option></select></label>` : null}
+                ${node.type !== "input" && node.type !== "output" ? html`<label class="pipe-field">Re-run cap (loop-back visits before the run fails)<input class="pipe-in" type="number" min="1" max="10" value=${node.config.maxVisits ?? 3} onInput=${(e) => patchConfig(node.id, "maxVisits", e.target.value === "" ? "" : Number(e.target.value))} /></label>` : null}
+                <p class="muted small">Templates: {{input}} · {{upstream}} · {{Node label}} · {{node-id}} · {{param:name}}${node.type === "refine" ? " · {{prev}} · {{index}}" : ""}${node.type === "map" ? " · child input: {{item}} · {{index}}" : ""}</p>
             </div>` : null}
 
             ${edge ? html`<div class="pipe-props" ref=${propsRef}>
@@ -392,7 +431,8 @@ export default function setup(pocket) {
                 <button class="button" onClick=${deleteSelected}>Delete edge</button></div>
                 <label class="pipe-field">When<select class="pipe-in" value=${edge.when === "true" || edge.when === "false" ? edge.when : (edge.when ? edge.when : "")} onChange=${(e) => setGraph((g) => ({ ...g, edges: g.edges.map((x) => x.id === edge.id ? { ...x, ...(e.target.value ? { when: e.target.value.slice(0, 80) } : { when: undefined }) } : x) }))}>
                     <option value="">always</option><option value="true">when true (branch / yes-no)</option><option value="false">when false (branch / yes-no)</option>${(edge.when && edge.when !== "true" && edge.when !== "false") ? html`<option value=${edge.when}>when: ${edge.when}</option>` : null}</select></label>
-                <label class="pipe-field">Or a category name (Decision outputs it; “unsure” for low confidence)<input class="pipe-in" value=${(edge.when === "true" || edge.when === "false") ? "" : (edge.when || "")} onInput=${(e) => setGraph((g) => ({ ...g, edges: g.edges.map((x) => x.id === edge.id ? { ...x, ...(e.target.value.trim() ? { when: e.target.value.trim().slice(0, 80) } : { when: undefined }) } : x) }))} placeholder="billing — or unsure" /></label>
+                <label class="pipe-field">Or a route value (category, high/low, “unsure”, or anything the step outputs)<input class="pipe-in" value=${(edge.when === "true" || edge.when === "false") ? "" : (edge.when || "")} onInput=${(e) => setGraph((g) => ({ ...g, edges: g.edges.map((x) => x.id === edge.id ? { ...x, ...(e.target.value.trim() ? { when: e.target.value.trim().slice(0, 80) } : { when: undefined }) } : x) }))} placeholder="billing — or unsure" /></label>
+                <label class="pipe-field">Loop-back note (appended to the target when this edge re-runs it)<input class="pipe-in" value=${edge.note || ""} onInput=${(e) => setGraph((g) => ({ ...g, edges: g.edges.map((x) => x.id === edge.id ? { ...x, ...(e.target.value.trim() ? { note: e.target.value.trim().slice(0, 2000) } : { note: undefined }) } : x) }))} placeholder="The page was a 404 — find the correct URL" /></label>
             </div>` : null}
 
             <div class="pipe-props">
@@ -403,6 +443,7 @@ export default function setup(pocket) {
                         ${sessions.map((s) => html`<option value=${s.id}>${s.title || `Session ${s.id}`}</option>`)}
                     </select></label>
                 <label class="pipe-field">Run input<textarea class="pipe-in" rows="3" value=${input} onInput=${(e) => setInput(e.target.value)} placeholder="Text for the Input node"></textarea></label>
+                <label class="pipe-field">Params (JSON, read as {{param:name}})<input class="pipe-in mono" value=${paramsText} onInput=${(e) => setParamsText(e.target.value)} placeholder='{"depth":"deep", "breadth":"5"}' /></label>
                 <button class="button primary" disabled=${busy} onClick=${run}>Run pipeline</button>
                 <button class="button" onClick=${loadRuns}>Refresh runs</button>
             </div>
@@ -422,6 +463,8 @@ export default function setup(pocket) {
                     ${openRun === r.id ? html`<div class="pipe-run-detail">
                         ${r.agentSessions ? Object.entries(r.agentSessions).map(([nid2, cid]) => { const src = ((r.graph && r.graph.nodes) || []).find((x) => x.id === nid2); return html`<p class="small">Agent step ${src && src.config && src.config.label ? `"${src.config.label}" ` : ""}${nid2}: <button class="button" onClick=${() => typeof pocket.openConversation === "function" && pocket.openConversation(cid)}>Open sub-session ${cid}</button></p>`; }) : null}
                         ${r.parentRunId ? html`<p class="muted small">Sub-run of ${r.parentRunId}</p>` : null}
+                        ${r.params && Object.keys(r.params).length ? html`<p class="muted small">Params: ${Object.entries(r.params).map(([k, v]) => `${k}=${v}`).join(" · ")}</p>` : null}
+                        ${(r.files || []).length ? html`<div><b class="small">Files (${r.files.length})</b>${r.files.map((f) => html`<div class="small mono">${f.path} <span class="muted">${f.bytes} bytes · ${f.label}</span></div>`)}</div>` : null}
                         ${Object.entries(r.outputs || {}).map(([id, text]) => { const src = ((r.graph && r.graph.nodes) || []).find((x) => x.id === id); const title = (src && src.config && src.config.label) || id; return html`<div><b class="small">${title}</b><pre class="pipe-out">${String(text).slice(0, 4000)}</pre></div>`; })}
                         ${(r.skipped || []).length ? html`<p class="muted small">Skipped: ${r.skipped.join(", ")}</p>` : null}
                         ${r.failedNodes && Object.keys(r.failedNodes).length ? html`<p class="small" style="color:var(--warn)">Failed but continued: ${Object.entries(r.failedNodes).map(([id, e]) => `${id}: ${e}`).join("; ")}</p>` : null}

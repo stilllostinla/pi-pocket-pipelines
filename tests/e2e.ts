@@ -132,7 +132,7 @@ await put("ShellLoop", {
     nodes: [
         { id: "in", type: "input", x: 0, y: 0, config: { label: "Input" } },
         { id: "sh", type: "bash", x: 0, y: 0, config: { label: "Shell", command: "echo hi {{input}}" } },
-        { id: "lp", type: "loop", x: 0, y: 0, config: { label: "Loop", prompt: "Round {{index}}: {{prev}}", times: 2 } },
+        { id: "lp", type: "refine", x: 0, y: 0, config: { label: "Loop", prompt: "Round {{index}}: {{prev}}", times: 2 } },
         { id: "cd", type: "code", x: 0, y: 0, config: { label: "Code", code: "return upstream + ' [coded]';" } },
         { id: "out", type: "output", x: 0, y: 0, config: { label: "Output", text: "{{Shell}} | {{Loop}} | {{Code}}" } },
     ],
@@ -142,9 +142,9 @@ await put("ShellLoop", {
     ],
 });
 const shell = await runPipe("ShellLoop", "there");
-check("shell+loop+code run done", shell.includes("· done"));
+check("shell+refine+code run done", shell.includes("· done"));
 check("bash output flowed", shell.includes("hi there"));
-check("loop iterated with prev/index", shell.includes("Round 2"));
+check("refine iterated with prev/index", shell.includes("Round 2"));
 check("code transformed", shell.includes("[coded]"));
 
 // 3. Parallel agents (scouts) + join by label
@@ -412,6 +412,114 @@ try {
     threwScore = e instanceof Error ? e.message : String(e);
 }
 check("score with one level is refused", threwScore.includes("at least 2 levels"));
+
+// 12. Map over a runtime list with a child pipeline.
+await put("ChildEcho", {
+    nodes: [
+        { id: "in", type: "input", x: 0, y: 0, config: { label: "Input" } },
+        { id: "p", type: "prompt", x: 0, y: 0, config: { label: "Echo", text: "got:{{input}}" } },
+        { id: "out", type: "output", x: 0, y: 0, config: { label: "Output", text: "{{upstream}}" } },
+    ],
+    edges: [{ id: "e1", from: "in", to: "p" }, { id: "e2", from: "p", to: "out" }],
+});
+await put("MapPipe", {
+    nodes: [
+        { id: "in", type: "input", x: 0, y: 0, config: { label: "Input" } },
+        { id: "m", type: "map", x: 0, y: 0, config: { label: "Fan", pipeline: "ChildEcho", list: '["a", "b", "c"]', itemTemplate: "item={{item}} #{{index}}", maxItems: 10, concurrency: 2 } },
+        { id: "out", type: "output", x: 0, y: 0, config: { label: "Output", text: "{{upstream}}" } },
+    ],
+    edges: [{ id: "m1", from: "in", to: "m" }, { id: "m2", from: "m", to: "out" }],
+});
+const mapped = await runPipe("MapPipe", "ignored");
+check("map fans out to child runs", mapped.includes("· done") && mapped.includes("item=a #1") && mapped.includes("item=c #3"));
+
+// Map from a file: one URL per line.
+import { writeFileSync as writeTmp, unlinkSync as unlinkTmp } from "node:fs";
+writeTmp("tests/.tmp-urls.txt", "https://example.com/1\nhttps://example.com/2\n");
+await put("MapFilePipe", {
+    nodes: [
+        { id: "in", type: "input", x: 0, y: 0, config: { label: "Input" } },
+        { id: "m", type: "map", x: 0, y: 0, config: { label: "Fan", pipeline: "ChildEcho", list: "file:tests/.tmp-urls.txt", concurrency: 1 } },
+        { id: "out", type: "output", x: 0, y: 0, config: { label: "Output", text: "{{upstream}}" } },
+    ],
+    edges: [{ id: "m1", from: "in", to: "m" }, { id: "m2", from: "m", to: "out" }],
+});
+const mapFile = await runPipe("MapFilePipe", "ignored");
+check("map reads file lists", mapFile.includes("· done") && mapFile.includes("https://example.com/2"));
+unlinkTmp("tests/.tmp-urls.txt");
+
+// 13. Loop-back repair: dead output routes back to the scout with a note.
+await put("RepairPipe", {
+    nodes: [
+        { id: "in", type: "input", x: 0, y: 0, config: { label: "Input" } },
+        { id: "scout", type: "prompt", x: 0, y: 0, config: { label: "Scout", text: "page {{upstream}}" } },
+        { id: "check", type: "branch", x: 0, y: 0, config: { label: "Check", template: "{{Scout}}", mode: "contains", value: "repaired" } },
+        { id: "out", type: "output", x: 0, y: 0, config: { label: "Output", text: "{{upstream}}" } },
+    ],
+    edges: [
+        { id: "m1", from: "in", to: "scout" },
+        { id: "m2", from: "scout", to: "check" },
+        { id: "m3", from: "check", to: "out", when: "true" },
+        { id: "m4", from: "check", to: "scout", when: "false", note: "repaired" },
+    ],
+});
+const repaired = await runPipe("RepairPipe", "http://x/bad");
+check("loop-back repairs and completes", repaired.includes("· done") && repaired.includes("repaired"));
+check("loop-back is logged", repaired.includes("Looping back to"));
+
+// 14. Merge under a token budget summarizes the rest.
+await put("MergePipe", {
+    nodes: [
+        { id: "in", type: "input", x: 0, y: 0, config: { label: "Input" } },
+        { id: "a", type: "prompt", x: 0, y: 0, config: { label: "A", text: "Alpha brief with findings 1. ".repeat(40) } },
+        { id: "b", type: "prompt", x: 0, y: 0, config: { label: "B", text: "Beta brief with findings 2. ".repeat(40) } },
+        { id: "m", type: "merge", x: 0, y: 0, config: { label: "Join", budget: 200, keep: 1 } },
+        { id: "out", type: "output", x: 0, y: 0, config: { label: "Output", text: "{{upstream}}" } },
+    ],
+    edges: [
+        { id: "m1", from: "in", to: "a" }, { id: "m2", from: "in", to: "b" },
+        { id: "m3", from: "a", to: "m" }, { id: "m4", from: "b", to: "m" },
+        { id: "m5", from: "m", to: "out" },
+    ],
+});
+const merged = await runPipe("MergePipe", "go");
+check("merge summarizes over-budget rest", merged.includes("· done") && merged.includes("Also ran (2 summarized)"));
+
+// 15. Write + read files tracked in the run manifest.
+await put("FilePipe", {
+    nodes: [
+        { id: "in", type: "input", x: 0, y: 0, config: { label: "Input" } },
+        { id: "w", type: "write", x: 0, y: 0, config: { label: "Save", file: "tests/.tmp-out.txt", text: "saved:{{input}}" } },
+        { id: "r", type: "read", x: 0, y: 0, config: { label: "Load", file: "tests/.tmp-out.txt" } },
+        { id: "out", type: "output", x: 0, y: 0, config: { label: "Output", text: "{{upstream}}" } },
+    ],
+    edges: [{ id: "m1", from: "in", to: "w" }, { id: "m2", from: "w", to: "r" }, { id: "m3", from: "r", to: "out" }],
+});
+const filed = await runPipe("FilePipe", "hello-file");
+check("write+read round-trips", filed.includes("· done") && filed.includes("saved:hello-file"));
+check("files tracked in manifest", filed.includes("tests/.tmp-out.txt") && filed.includes("bytes"));
+unlinkTmp("tests/.tmp-out.txt");
+
+// 16. Run params reach templates as {{param:name}}.
+await put("ParamPipe", {
+    nodes: [
+        { id: "in", type: "input", x: 0, y: 0, config: { label: "Input" } },
+        { id: "p", type: "prompt", x: 0, y: 0, config: { label: "Prep", text: "level {{param:depth}} on {{input}}" } },
+        { id: "out", type: "output", x: 0, y: 0, config: { label: "Output", text: "{{upstream}}" } },
+    ],
+    edges: [{ id: "m1", from: "in", to: "p" }, { id: "m2", from: "p", to: "out" }],
+});
+seq++;
+const paramStarted = (await tool("pipe_run").execute({ pipeline: "ParamPipe", input: "topic", paramsJson: '{"depth":"deep"}' } as never, api(seq, `r${seq}`), context as never)).output[0]!.text;
+const paramRunId = paramStarted.match(/run \S+/)?.[0].slice(4) ?? "";
+let paramStatus = "";
+for (let i = 0; i < 40; i++) {
+    await new Promise((r) => setTimeout(r, 400));
+    seq++;
+    paramStatus = (await tool("pipe_status").execute({ runId: paramRunId } as never, api(seq, `s${seq}`), context as never)).output[0]!.text;
+    if (paramStatus.includes("· done") || paramStatus.includes("· failed")) break;
+}
+check("params reach templates", paramStatus.includes("· done") && paramStatus.includes("level deep on topic"));
 
 // 11. Secrets catalog: settings → catalog → env; gating honored.
 delete process.env.TYPESAFE_API_KEY;

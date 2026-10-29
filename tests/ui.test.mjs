@@ -143,12 +143,9 @@ await act(async () => {
 check("connecting decision to output adds an edge", $$(".pedge").length === 3);
 await click($$(".pedge").pop());
 await flush(30);
-const edgeSelect = $$(".pipe-props").length > 1 ? null : null;
-await selectOption($$(".pipe-props").at(-1)?.querySelector(".pipe-field select"), "__custom");
-await flush(20);
 const edgePanel = $$(".pipe-props").find(x => x.textContent.includes("Connection"));
 const whenInput = edgePanel
-  ? [...edgePanel.querySelectorAll(".pipe-field")].find(f => f.textContent.startsWith("Or a category name"))?.querySelector("input")
+  ? [...edgePanel.querySelectorAll(".pipe-field")].find(f => f.textContent.startsWith("Or a route value"))?.querySelector("input")
   : null;
 check("edge offers a category-name when", !!whenInput);
 await typeText(whenInput, "billing", dom.window.HTMLInputElement);
@@ -173,6 +170,44 @@ await click($$("button").find(b => b.textContent === "Save"));
 await flush(30);
 const gSaved = savedBody?.graph;
 check("save payload: decision provider+score", (gSaved?.nodes ?? []).some(n => n.type === "decision" && n.config.provider === "openai" && n.config.kind === "score" && (n.config.categories || "").includes("high: blocked") && n.config.cut === 1.5));
+
+// H: v2 nodes — map, merge, write, read, fetch, refine
+await click($$("button").find(b => b.textContent === "New"));
+await flush(30);
+for (const label of ["Map", "Merge", "Write file", "Read file", "Fetch URL", "Refine"]) {
+  await click($$(".pipe-add").find(b => b.textContent.includes(label)));
+  await flush(20);
+}
+check("v2 palette adds six nodes", $$(".pnode").length === 3 + 6);
+check("no Loop node anymore", !$$(".pnode").some(n => n.textContent.includes("Loop")));
+const mapNode = $$(".pnode").find(n => n.textContent.includes("Map"));
+await act(async () => { mapNode.dispatchEvent(new dom.window.MouseEvent("pointerdown", { bubbles: true })); await new Promise(r => setTimeout(r, 30)); });
+check("map props open", !!field("Pipeline (runs once per item)"));
+await typeText(field("List")?.querySelector("textarea"), '["a", "b"]', dom.window.HTMLTextAreaElement);
+await typeText(field("Child input template")?.querySelector("textarea"), "item={{item}}", dom.window.HTMLTextAreaElement);
+const fetchNode = $$(".pnode").find(n => n.textContent.includes("Fetch URL"));
+await act(async () => { fetchNode.dispatchEvent(new dom.window.MouseEvent("pointerdown", { bubbles: true })); await new Promise(r => setTimeout(r, 30)); });
+await typeText(field("URL")?.querySelector("textarea"), "https://example.com/page", dom.window.HTMLTextAreaElement);
+const mergeNode = $$(".pnode").find(n => n.textContent.includes("Merge"));
+await act(async () => { mergeNode.dispatchEvent(new dom.window.MouseEvent("pointerdown", { bubbles: true })); await new Promise(r => setTimeout(r, 30)); });
+await selectOption(field("The rest")?.querySelector("select"), "drop-rest");
+// Edge note for loop-back
+const firstEdge = $$(".pedge")[0];
+await click(firstEdge);
+await flush(30);
+const noteInput = [...document.querySelectorAll(".pipe-props")].find(x => x.textContent.includes("Connection"))?.querySelectorAll(".pipe-field");
+const noteField = [...(noteInput ?? [])].find(f => f.textContent.startsWith("Loop-back note"))?.querySelector("input");
+check("edge offers loop-back note", !!noteField);
+await typeText(noteField, "try again", dom.window.HTMLInputElement);
+await click($$("button").find(b => b.textContent === "Save"));
+await flush(30);
+const hSaved = savedBody?.graph;
+check("save payload: map config", (hSaved?.nodes ?? []).some(n => n.type === "map" && (n.config.list || "").includes('["a", "b"]') && (n.config.itemTemplate || "").includes("item={{item}}")));
+check("save payload: merge strategy", (hSaved?.nodes ?? []).some(n => n.type === "merge" && n.config.strategy === "drop-rest"));
+check("save payload: fetch url", (hSaved?.nodes ?? []).some(n => n.type === "fetch" && (n.config.template || "").includes("https://example.com/page")));
+check("save payload: write/read/refine present", ["write", "read", "refine"].every(t => (hSaved?.nodes ?? []).some(n => n.type === t)));
+check("save payload: edge note", (hSaved?.edges ?? []).some(e => e.note === "try again"));
+check("run params field exists", [...document.querySelectorAll(".pipe-props")].some(x => x.textContent.includes("Params (JSON")));
 
 console.log(fails.length ? `UI-FAIL (${fails.length})` : "UI-OK");
 process.exit(fails.length ? 1 : 0);
